@@ -19,6 +19,7 @@ Primary target is the X-ray fracture challenge training loop.
    - process timeout windows
    - basic liveness heartbeat
 5. Never tune on test split.
+6. Do not execute nnU-Net/nnUNet/nnUNetv2 pipelines in this repo (reserved for later manual comparison against this loop).
 
 ## Control Files
 - Stop daemon: `.llm_loop/STOP_DAEMON`
@@ -57,12 +58,11 @@ Primary target is the X-ray fracture challenge training loop.
 
 ## Initial Execution Agenda
 1. Start with a fast baseline run on the challenge stack to validate pipeline health.
-2. Perform an explicit model-selection bracket before deep tuning:
-   - Compare at least 3 architecture/backbone candidates under equal fast budget.
-   - Select winner based on validation evidence.
-   - Record winner in `.llm_loop/artifacts/MODEL_SELECTION_DONE.md`.
-3. Then iterate with targeted rechallenges focused on metric improvement.
-4. Keep each rechallenge change deliberate and traceable.
+2. Inspect the data early (class balance, mask quality, obvious edge cases) and write short notes/hypotheses.
+3. Do a quick online scan of strong approaches for similar medical segmentation tasks, then adapt ideas pragmatically.
+   - Generic patterns are good; avoid copy-pasting any single turnkey framework recipe.
+4. Run a mixed set of targeted experiments (preprocessing, augmentation, sampling, loss, and architecture as needed), not only optimizer micro-tuning.
+5. Keep each rechallenge change deliberate and traceable.
 
 ## Subagent Note
 The planner prompt explicitly allows Codex to delegate to subagents when that improves execution quality.

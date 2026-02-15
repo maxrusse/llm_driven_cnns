@@ -13,6 +13,12 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+FORBIDDEN_EXECUTION_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\bnnunetv2_(plan_and_preprocess|train|predict|find_best_configuration|preprocess|evaluate)\b", "nnunetv2_cli"),
+    (r"\bpython(?:\.exe)?\s+-m\s+nnunet(?:v2)?\b", "python_module_nnunet"),
+    (r"\bnn-u-net\b", "nn-u-net_cli"),
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -45,8 +51,8 @@ def tail_text(path: pathlib.Path, max_bytes: int = 24000) -> str:
         with path.open("rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            if size > max_bytes:
-                f.seek(size - max_bytes)
+            start = size - max_bytes if size > max_bytes else 0
+            f.seek(start)
             data = f.read()
         return data.decode("utf-8", errors="ignore")
     except Exception:
@@ -113,6 +119,14 @@ def infer_idea_category(*, rationale: str = "", command: str = "", run_label: st
         if any(k in text for k in keys):
             return cat
     return "other"
+
+
+def detect_forbidden_command_usage(command: str) -> tuple[bool, str]:
+    text = command or ""
+    for pattern, label in FORBIDDEN_EXECUTION_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return True, label
+    return False, ""
 
 
 def is_pid_running(pid: int) -> bool:
@@ -188,9 +202,12 @@ def build_prompt(
         "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
         "If recent runs repeat one category or metrics stagnate, choose a different category next and state why.",
         "Always set `idea_category` for your chosen action.",
-        "Before deep tuning, run an explicit model-selection bracket: compare at least 3 architecture/backbone candidates under equal fast budget.",
-        "Do not keep tuning one stack if model-selection is not yet completed.",
-        "After selecting a winner, write `.llm_loop/artifacts/MODEL_SELECTION_DONE.md` with winner + evidence.",
+        "Use a lightweight discovery flow: baseline -> inspect data -> quick online search for relevant strong approaches -> targeted experiments.",
+        "Architecture probes are optional (1-2 quick probes when uncertainty is high), not mandatory before data-centric work.",
+        "Shift early into data-centric exploration: include preprocessing and augmentation or data_sampling ideas before many optimizer micro-tweaks.",
+        "Keep tone practical and concise in rationale; avoid over-planning.",
+        "Hard constraint: do not execute nnU-Net/nnUNet/nnUNetv2 pipelines here (reserved for separate manual comparison).",
+        "When using internet research, extract generic strategy patterns and evidence quality signals; do not copy a turnkey pipeline verbatim.",
     ]
     if rechallenge_on_done:
         rules.append(
@@ -217,6 +234,14 @@ def build_prompt(
             "default_monitor_seconds": default_monitor_seconds,
             "max_monitor_seconds": max_monitor_seconds,
             "rechallenge_on_done": rechallenge_on_done,
+        },
+        "hard_constraints": {
+            "forbidden_approaches": [
+                "nnU-Net",
+                "nnUNet",
+                "nnUNetv2",
+            ],
+            "forbidden_execution_only": True,
         },
         "runtime_context": context,
     }
@@ -474,9 +499,10 @@ def collect_context(
         "notes_text": read_text_head(loop_dir / "artifacts" / "notes.md", max_chars=8000),
         "condensed_log_file": str(loop_dir / "artifacts" / "condensed_log.md"),
         "condensed_log_tail": read_text_head(loop_dir / "artifacts" / "condensed_log.md", max_chars=6000),
-        "model_selection": {
+        "architecture_probe": {
+            "optional": True,
             "marker_file": str(model_selection_marker),
-            "completed": model_selection_marker.exists(),
+            "marker_exists": model_selection_marker.exists(),
             "candidates_hint": [
                 "simple_unet",
                 "deeplabv3_resnet50",
@@ -1134,35 +1160,43 @@ def main() -> None:
     elif action == "run_command":
         if not command:
             cycle_result["result"] = "invalid_empty_command"
-        elif isinstance(active, dict) and isinstance(active.get("pid"), int) and is_pid_running(int(active["pid"])):
-            cycle_result["result"] = "active_run_exists"
-            cycle_result["active_pid"] = int(active["pid"])
         else:
-            run_outcome = run_new_command(
-                workspace_root=workspace_root,
-                command=command,
-                run_label=run_label,
-                monitor_seconds=monitor_seconds,
-                cycle_poll_seconds=cycle_poll_seconds,
-                stop_flags=[stop_daemon_flag, stop_current_run_flag],
-                stop_patterns=stop_patterns,
-                state=state,
-                events_path=events_file,
-            )
-            cycle_result["result"] = "run_command"
-            cycle_result["run_outcome"] = run_outcome
-            status = str(run_outcome.get("status", ""))
-            exit_code = run_outcome.get("exit_code")
-            if status in {"completed", "killed"}:
-                state["last_completed_run"] = {
-                    "ended_utc": utc_now(),
-                    "status": status,
-                    "run_label": run_label,
-                    "command": command,
-                    "outcome": run_outcome,
-                }
-                if run_label == bootstrap_label:
-                    state["bootstrap_successful"] = bool(status == "completed" and exit_code == 0)
+            blocked, blocked_token = detect_forbidden_command_usage(command)
+            if blocked:
+                cycle_result["result"] = "blocked_forbidden_approach"
+                cycle_result["blocked_token"] = blocked_token
+                cycle_result["rationale"] = (
+                    (rationale + " | ") if rationale else ""
+                ) + f"blocked forbidden approach token: {blocked_token}"
+            elif isinstance(active, dict) and isinstance(active.get("pid"), int) and is_pid_running(int(active["pid"])):
+                cycle_result["result"] = "active_run_exists"
+                cycle_result["active_pid"] = int(active["pid"])
+            else:
+                run_outcome = run_new_command(
+                    workspace_root=workspace_root,
+                    command=command,
+                    run_label=run_label,
+                    monitor_seconds=monitor_seconds,
+                    cycle_poll_seconds=cycle_poll_seconds,
+                    stop_flags=[stop_daemon_flag, stop_current_run_flag],
+                    stop_patterns=stop_patterns,
+                    state=state,
+                    events_path=events_file,
+                )
+                cycle_result["result"] = "run_command"
+                cycle_result["run_outcome"] = run_outcome
+                status = str(run_outcome.get("status", ""))
+                exit_code = run_outcome.get("exit_code")
+                if status in {"completed", "killed"}:
+                    state["last_completed_run"] = {
+                        "ended_utc": utc_now(),
+                        "status": status,
+                        "run_label": run_label,
+                        "command": command,
+                        "outcome": run_outcome,
+                    }
+                    if run_label == bootstrap_label:
+                        state["bootstrap_successful"] = bool(status == "completed" and exit_code == 0)
     else:
         cycle_result["result"] = "wait"
 
