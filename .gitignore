@@ -1,0 +1,8 @@
+.llm_loop/
+.npm-cache/
+node_modules/
+__pycache__/
+*.pyc
+runs/
+data/
+*.log

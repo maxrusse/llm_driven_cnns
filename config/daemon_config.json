@@ -1,0 +1,20 @@
+{
+  "run_id": "llm_driven_cnns_day01",
+  "model": "gpt-5.3-codex",
+  "reasoning_effort": "high",
+  "web_search_mode": "live",
+  "network_access_enabled": true,
+  "skip_git_repo_check": true,
+  "daemon_poll_seconds": 20,
+  "cycle_poll_seconds": 5,
+  "default_monitor_seconds": 300,
+  "max_monitor_seconds": 1800,
+  "rechallenge_on_done": true,
+  "force_bootstrap_if_idle": true,
+  "bootstrap_label": "xray_fastdev_bootstrap",
+  "bootstrap_command": "Set-Location 'C:\\Users\\Max\\code\\xray_fracture_benchmark'; $env:PYTHONPATH='C:\\Users\\Max\\code\\xray_fracture_benchmark'; & 'C:\\Users\\Max\\code\\xray_fracture_benchmark_venv\\Scripts\\python.exe' 'scripts\\train.py' --config 'configs\\fast_dev.yaml' --output-dir 'runs\\llm_bootstrap_fastdev'",
+  "workspace_root": "C:\\Users\\Max\\code\\llm_driven_cnns",
+  "mission_file": "AGENTS.md",
+  "python_exe": "C:\\Users\\Max\\code\\bio_guideloop_xraychallenge_venv\\Scripts\\python.exe",
+  "data_source_root": "C:\\Users\\Max\\code\\xray_fracture_benchmark\\data"
+}
