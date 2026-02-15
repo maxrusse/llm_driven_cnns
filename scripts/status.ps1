@@ -7,11 +7,8 @@ $cfgPath = Join-Path $WorkspaceRoot "config\\daemon_config.json"
 $hb = Join-Path $WorkspaceRoot ".llm_loop\\logs\\daemon_heartbeat.json"
 $state = Join-Path $WorkspaceRoot ".llm_loop\\state.json"
 $events = Join-Path $WorkspaceRoot ".llm_loop\\logs\\events.jsonl"
-$summary = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\cycle_summary.md"
 $storyline = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\storyline.md"
-$condensed = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\condensed_log.md"
-$notes = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\notes.md"
-$todo = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\todo.md"
+$workpad = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\workpad.md"
 
 if (Test-Path $hb) {
     Write-Host "Heartbeat:"
@@ -50,34 +47,16 @@ if (Test-Path $state) {
     Get-Content -Path $state
 }
 
-if (Test-Path $summary) {
-    Write-Host ""
-    Write-Host "Cycle summary (6-point):"
-    Get-Content -Path $summary
-}
-
 if (Test-Path $storyline) {
     Write-Host ""
-    Write-Host "Storyline (latest 30 lines):"
-    Get-Content -Path $storyline -Tail 30
+    Write-Host "Storyline (latest 40 lines):"
+    Get-Content -Path $storyline -Tail 40
 }
 
-if (Test-Path $condensed) {
+if (Test-Path $workpad) {
     Write-Host ""
-    Write-Host "Condensed log (latest 20 lines):"
-    Get-Content -Path $condensed -Tail 20
-}
-
-if (Test-Path $todo) {
-    Write-Host ""
-    Write-Host "TODO (latest 20 lines):"
-    Get-Content -Path $todo -Tail 20
-}
-
-if (Test-Path $notes) {
-    Write-Host ""
-    Write-Host "Notes (latest 20 lines):"
-    Get-Content -Path $notes -Tail 20
+    Write-Host "Workpad (latest 80 lines):"
+    Get-Content -Path $workpad -Tail 80
 }
 
 if (Test-Path $events) {

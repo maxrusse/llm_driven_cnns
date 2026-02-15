@@ -72,6 +72,42 @@ def read_text_head(path: pathlib.Path, max_chars: int = 12000) -> str:
     return txt[:max_chars]
 
 
+def ensure_workpad_file(loop_dir: pathlib.Path) -> pathlib.Path:
+    artifacts_dir = loop_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    workpad_path = artifacts_dir / "workpad.md"
+    if workpad_path.exists():
+        return workpad_path
+
+    lines = [
+        "# LLM Workpad",
+        "",
+        "## TODO",
+        "",
+        "## Notes",
+        "",
+        "## Data Exploration",
+        "",
+    ]
+    workpad_path.write_text("\n".join(lines), encoding="utf-8")
+
+    legacy_parts: list[str] = []
+    legacy_files = [
+        ("TODO", artifacts_dir / "todo.md"),
+        ("Notes", artifacts_dir / "notes.md"),
+        ("Data Exploration", artifacts_dir / "data_exploration.md"),
+    ]
+    for title, src in legacy_files:
+        txt = read_text_head(src, max_chars=16000)
+        if txt:
+            legacy_parts.append(f"### Legacy Import: {title}\n{txt}\n")
+    if legacy_parts:
+        with workpad_path.open("a", encoding="utf-8") as f:
+            f.write("\n## Legacy Imports\n\n")
+            f.write("\n".join(legacy_parts))
+    return workpad_path
+
+
 def run_cmd(args: list[str], cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
 
@@ -207,9 +243,11 @@ def build_prompt(
         "Use shutdown_daemon only when run should end now.",
         "When helpful, you may delegate to subagents conceptually; still output one action now.",
         "Use mission/contract text as agenda and execute it step-by-step.",
-        "Maintain a running todo in .llm_loop/artifacts/todo.md and update it as work progresses.",
-        "Maintain concise working notes in .llm_loop/artifacts/notes.md (assumptions, dead-ends, next hypotheses).",
-        "Maintain/update .llm_loop/artifacts/data_exploration.md as a living dataset understanding document.",
+        "At the start of every cycle, re-check runtime status: active_run, last_completed_run, and recent events before deciding.",
+        "Re-check mission goals each cycle against mission_text; if goals and action diverge, correct course now.",
+        "Re-read .llm_loop/artifacts/storyline.md and .llm_loop/artifacts/workpad.md when uncertain or stuck, then decide using already-completed work as evidence.",
+        "Maintain one structured workspace file at .llm_loop/artifacts/workpad.md.",
+        "Inside workpad.md, keep sections for TODO, Notes, and Data Exploration updated with concise UTC-stamped entries.",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
         "Operate like a data scientist, not only a hyperparameter tuner.",
         "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
@@ -255,10 +293,8 @@ def build_prompt(
             "shutdown_daemon": "Create stop flag and end daemon loop.",
         },
         "artifacts_contract": {
-            "todo": ".llm_loop/artifacts/todo.md",
-            "notes": ".llm_loop/artifacts/notes.md",
-            "data_exploration": ".llm_loop/artifacts/data_exploration.md",
-            "condensed_log": ".llm_loop/artifacts/condensed_log.md",
+            "storyline": ".llm_loop/artifacts/storyline.md",
+            "workpad": ".llm_loop/artifacts/workpad.md",
         },
         "defaults": {
             "default_monitor_seconds": default_monitor_seconds,
@@ -292,7 +328,7 @@ def call_codex(
     prompt: str,
     output_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    io_dir = workspace_root / ".llm_loop" / "artifacts" / "_codex_io"
+    io_dir = workspace_root / ".llm_loop" / "logs" / "_codex_io"
     io_dir.mkdir(parents=True, exist_ok=True)
     schema_path = io_dir / f"schema_{uuid.uuid4().hex}.json"
     schema_path.write_text(json.dumps(output_schema, ensure_ascii=True), encoding="utf-8")
@@ -460,9 +496,12 @@ def collect_context(
 ) -> dict[str, Any]:
     loop_dir = workspace_root / ".llm_loop"
     logs_dir = loop_dir / "logs"
+    artifacts_dir = loop_dir / "artifacts"
     events_path = logs_dir / "events.jsonl"
     summaries_path = logs_dir / "cycle_summaries.jsonl"
-    model_selection_marker = loop_dir / "artifacts" / "MODEL_SELECTION_DONE.md"
+    model_selection_marker = artifacts_dir / "MODEL_SELECTION_DONE.md"
+    workpad_path = ensure_workpad_file(loop_dir)
+    storyline_path = artifacts_dir / "storyline.md"
     latest_logs = []
     for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:6]:
         latest_logs.append(
@@ -617,14 +656,10 @@ def collect_context(
         "recent_logs": latest_logs,
         "mission_file": str(mission_path),
         "mission_text": read_text_head(mission_path, max_chars=12000),
-        "todo_file": str(loop_dir / "artifacts" / "todo.md"),
-        "todo_text": read_text_head(loop_dir / "artifacts" / "todo.md", max_chars=8000),
-        "notes_file": str(loop_dir / "artifacts" / "notes.md"),
-        "notes_text": read_text_head(loop_dir / "artifacts" / "notes.md", max_chars=8000),
-        "data_exploration_file": str(loop_dir / "artifacts" / "data_exploration.md"),
-        "data_exploration_text": read_text_head(loop_dir / "artifacts" / "data_exploration.md", max_chars=10000),
-        "condensed_log_file": str(loop_dir / "artifacts" / "condensed_log.md"),
-        "condensed_log_tail": read_text_head(loop_dir / "artifacts" / "condensed_log.md", max_chars=6000),
+        "workpad_file": str(workpad_path),
+        "workpad_text": read_text_head(workpad_path, max_chars=20000),
+        "storyline_file": str(storyline_path),
+        "storyline_tail": read_text_head(storyline_path, max_chars=9000),
         "architecture_probe": {
             "optional": True,
             "marker_file": str(model_selection_marker),
@@ -686,8 +721,8 @@ def collect_context(
             "research_pass_due": research_pass_due,
             "non_training_cycle_due": non_training_cycle_due,
             "recommended_non_training_actions": [
-                "deeper dataset quality/split analysis and update data_exploration.md",
-                "online literature/pattern scan summarized in notes with explicit takeaways",
+                "deeper dataset quality/split analysis and update workpad Data Exploration section",
+                "online literature/pattern scan summarized in workpad Notes with explicit takeaways",
                 "error analysis on recent outputs to identify dominant failure mode",
             ],
         },
@@ -972,38 +1007,15 @@ def write_cycle_summary(
     tool_short = ", ".join(str(x) for x in tool_signals[:4]) if tool_signals else "none"
     trace_file = str(codex_telemetry.get("trace_file", "n/a")) if isinstance(codex_telemetry, dict) else "n/a"
 
-    lines = [
-        f"# Cycle Summary {cycle_index}",
-        "",
-        f"- Time (UTC): {now_utc}",
-        f"- Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, result={cycle_result.get('result', 'n/a')}, run_label={run_label}",
-        f"- Why: {rationale or 'n/a'}",
-        f"- Run state: outcome={run_status}, active_run={active_txt}, monitor_seconds={monitor_seconds}",
-        f"- Quality snapshot: rows_parsed={evidence.get('current_rows_count', 0)}; best_this_run[{metric_short(current_best)}] | latest_seen[{metric_short(current_latest)}]",
-        f"- Delta vs previous completed run (best val_dice_pos): {delta_txt}",
-        f"- LLM work evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tool_signals={tool_short}",
-        f"- Codex trace: {trace_file}",
-    ]
-    summary_md = "\n".join(lines) + "\n"
-
-    artifacts_dir = workspace_root / ".llm_loop" / "artifacts"
-    summary_dir = artifacts_dir / "summaries"
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    cycle_file = summary_dir / f"{stamp}_cycle_{cycle_index:04d}.md"
-    latest_file = artifacts_dir / "cycle_summary.md"
-    cycle_file.write_text(summary_md, encoding="utf-8")
-    latest_file.write_text(summary_md, encoding="utf-8")
-
+    summaries_log = workspace_root / ".llm_loop" / "logs" / "cycle_summaries.jsonl"
     append_jsonl(
-        workspace_root / ".llm_loop" / "logs" / "cycle_summaries.jsonl",
+        summaries_log,
         {
             "ts_utc": now_utc,
             "cycle": cycle_index,
             "action": cycle_result.get("action"),
             "result": cycle_result.get("result"),
             "run_label": run_label,
-            "summary_file": str(cycle_file),
             "best_val_dice_pos": current_best_dice,
             "prev_best_val_dice_pos": prev_best_dice,
             "delta_best_val_dice_pos": delta,
@@ -1013,7 +1025,7 @@ def write_cycle_summary(
             "tool_signals": tool_signals[:12],
         },
     )
-    return latest_file
+    return summaries_log
 
 
 def write_storyline(
@@ -1079,67 +1091,6 @@ def write_storyline(
     with storyline_file.open("a", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return storyline_file
-
-
-def append_condensed_log(
-    *,
-    workspace_root: pathlib.Path,
-    cycle_index: int,
-    cycle_result: dict[str, Any],
-    run_label: str,
-    previous_last_completed: Any,
-    state: dict[str, Any],
-    codex_telemetry: dict[str, Any],
-) -> pathlib.Path:
-    now_utc = utc_now()
-    evidence = build_quality_evidence(
-        cycle_result=cycle_result,
-        previous_last_completed=previous_last_completed,
-        state=state,
-    )
-    best = evidence["current_best"] if isinstance(evidence["current_best"], dict) else None
-    latest = evidence["current_latest"] if isinstance(evidence["current_latest"], dict) else None
-    delta = safe_float(evidence.get("delta_best_dice"))
-    delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
-    best_txt = format_num(safe_float(best.get("val_dice_pos")) if best else None)
-    latest_txt = format_num(safe_float(latest.get("val_dice_pos")) if latest else None)
-
-    run_outcome = cycle_result.get("run_outcome")
-    status_txt = "n/a"
-    if isinstance(run_outcome, dict):
-        status_txt = str(run_outcome.get("status", "n/a"))
-        if run_outcome.get("exit_code") is not None:
-            status_txt += f":{run_outcome.get('exit_code')}"
-    used_web = bool(codex_telemetry.get("used_web_search", False)) if isinstance(codex_telemetry, dict) else False
-    parsed_events = int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0
-    rationale = str(cycle_result.get("rationale", "")).strip().replace("\n", " ")
-    if len(rationale) > 120:
-        rationale = rationale[:117] + "..."
-    line = (
-        f"- {now_utc} | c{cycle_index:04d} | {cycle_result.get('action','n/a')}:{cycle_result.get('idea_category','n/a')} "
-        f"| {run_label} | {status_txt} | best={best_txt} latest={latest_txt} d={delta_txt} "
-        f"| rows={evidence.get('current_rows_count',0)} web={str(used_web).lower()} events={parsed_events} | {rationale}"
-    )
-
-    artifacts_dir = workspace_root / ".llm_loop" / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    condensed_file = artifacts_dir / "condensed_log.md"
-    if not condensed_file.exists():
-        condensed_file.write_text("# Condensed Log\n\n", encoding="utf-8")
-    with condensed_file.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-    # Keep this file readable by capping to latest ~220 lines plus header.
-    try:
-        lines = condensed_file.read_text(encoding="utf-8").splitlines()
-        header = lines[:2] if len(lines) >= 2 else ["# Condensed Log", ""]
-        body = lines[2:]
-        if len(body) > 220:
-            body = body[-220:]
-        condensed_file.write_text("\n".join(header + body) + "\n", encoding="utf-8")
-    except Exception:
-        pass
-    return condensed_file
 
 
 def main() -> None:
@@ -1378,7 +1329,7 @@ def main() -> None:
             state=state,
             codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},
         )
-        cycle_result["summary_file"] = str(summary_file)
+        cycle_result["summary_log"] = str(summary_file)
     except Exception as exc:
         cycle_result["summary_error"] = str(exc)
     try:
@@ -1395,20 +1346,6 @@ def main() -> None:
         cycle_result["storyline_file"] = str(storyline_file)
     except Exception as exc:
         cycle_result["storyline_error"] = str(exc)
-    try:
-        condensed_file = append_condensed_log(
-            workspace_root=workspace_root,
-            cycle_index=cycle_index,
-            cycle_result=cycle_result,
-            run_label=run_label,
-            previous_last_completed=previous_last_completed,
-            state=state,
-            codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},
-        )
-        cycle_result["condensed_log_file"] = str(condensed_file)
-    except Exception as exc:
-        cycle_result["condensed_log_error"] = str(exc)
-
     write_json(state_file, state)
     append_jsonl(events_file, cycle_result)
     print(json.dumps(cycle_result, ensure_ascii=True))

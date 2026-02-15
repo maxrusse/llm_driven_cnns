@@ -15,6 +15,6 @@
   "bootstrap_command": "Set-Location 'C:\\Users\\Max\\code\\xray_fracture_benchmark'; $env:PYTHONPATH='C:\\Users\\Max\\code\\xray_fracture_benchmark'; & 'C:\\Users\\Max\\code\\xray_fracture_benchmark_venv\\Scripts\\python.exe' 'scripts\\train.py' --config 'configs\\fast_dev.yaml' --output-dir 'runs\\llm_bootstrap_fastdev'",
   "workspace_root": "C:\\Users\\Max\\code\\llm_driven_cnns",
   "mission_file": "AGENTS.md",
-  "python_exe": "C:\\Users\\Max\\code\\bio_guideloop_xraychallenge_venv\\Scripts\\python.exe",
+  "python_exe": "C:\\Users\\Max\\code\\llm_driven_cnns_venv\\Scripts\\python.exe",
   "data_source_root": "C:\\Users\\Max\\code\\xray_fracture_benchmark\\data"
 }
