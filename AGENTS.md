@@ -49,6 +49,8 @@ Primary target is the X-ray fracture challenge training loop.
 4. Keep a dual objective:
    - improve segmentation quality
    - push fracture-presence classification performance toward domain-competitive / SOTA-level ranges from literature.
+5. Avoid train-only drift:
+   - after several consecutive training runs, run a non-training exploration cycle (data/error analysis + online scan) before more training.
 
 ## Data Exploration Depth
 1. Treat the quick audit script as first-pass only, not full dataset understanding.
@@ -59,6 +61,7 @@ Primary target is the X-ray fracture challenge training loop.
    - resolution/aspect/view heterogeneity and preprocessing implications
    - positive-case strata (fracture size, sparse-mask regimes, hard negatives)
 4. Convert findings into concrete experiment hypotheses, not only hyperparameter tweaks.
+5. Revisit this exploration periodically, not just once at startup.
 
 ## Scientific Working Style (Soft Guidance)
 1. Use hypothesis-driven iteration:

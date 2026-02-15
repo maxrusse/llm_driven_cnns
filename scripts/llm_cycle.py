@@ -129,6 +129,18 @@ def detect_forbidden_command_usage(command: str) -> tuple[bool, str]:
     return False, ""
 
 
+def is_training_command_text(text: str) -> bool:
+    t = (text or "").lower()
+    hints = (
+        "scripts\\train.py",
+        "scripts/train.py",
+        " train.py",
+        "--output-dir",
+        "trainer.fit(",
+    )
+    return any(h in t for h in hints)
+
+
 def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -210,6 +222,9 @@ def build_prompt(
         "Keep a dual objective: improve segmentation overlap and push fracture-presence classification metrics toward domain-competitive (SOTA-like) ranges.",
         "Track and discuss classification behavior explicitly (presence precision/recall and calibration), not only segmentation dice.",
         "Use online references to anchor what strong classification performance looks like in this domain, then adapt pragmatically.",
+        "Avoid train-only loops: insert regular non-training cycles for deeper data exploration and literature synthesis.",
+        "If exploration_cadence_context.research_pass_due is true, do web search in this decision cycle before choosing the next command.",
+        "If exploration_cadence_context.non_training_cycle_due is true, choose a non-training run_command this cycle (no scripts/train.py).",
         "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
         "In data exploration, include split/leakage checks, label quality checks, resolution/view heterogeneity, and positive-case strata analysis.",
         "Translate data findings into concrete hypotheses and experiments; do not stay in threshold/LR tuning only.",
@@ -467,6 +482,8 @@ def collect_context(
 
     recent_events = read_recent_jsonl(events_path, max_lines=24)
     recent_categories: list[str] = []
+    recent_training_flags: list[bool] = []
+    recent_web_flags: list[bool] = []
     for e in recent_events:
         cat = str(e.get("idea_category", "")).strip().lower()
         if not cat:
@@ -476,6 +493,12 @@ def collect_context(
                 run_label=str(e.get("run_label", "")),
             )
         recent_categories.append(cat)
+        cmd_preview = str(e.get("command_preview", ""))
+        run_label_hint = str(e.get("run_label", ""))
+        recent_training_flags.append(is_training_command_text(cmd_preview) or is_training_command_text(run_label_hint))
+        codex_info = e.get("codex")
+        web_used = bool(codex_info.get("used_web_search", False)) if isinstance(codex_info, dict) else False
+        recent_web_flags.append(web_used)
     distinct_recent_categories = len({c for c in recent_categories if c})
     repeated_category_streak = 0
     if recent_categories:
@@ -554,6 +577,25 @@ def collect_context(
     online_research_needed = cycles_with_summaries >= 3 and recent_web_search_count == 0
     orientation_phase_limit = 2
     orientation_phase_over = cycles_with_summaries > orientation_phase_limit
+
+    recent_training_window = recent_training_flags[-8:] if recent_training_flags else []
+    consecutive_training_runs = 0
+    for tf in reversed(recent_training_window):
+        if tf:
+            consecutive_training_runs += 1
+        else:
+            break
+    cycles_since_last_web_search = 0
+    seen_web = False
+    for wf in reversed(recent_web_flags):
+        if wf:
+            seen_web = True
+            break
+        cycles_since_last_web_search += 1
+    if not seen_web:
+        cycles_since_last_web_search = len(recent_web_flags)
+    research_pass_due = (consecutive_training_runs >= 3 and cycles_since_last_web_search >= 2) or cycles_since_last_web_search >= 4
+    non_training_cycle_due = consecutive_training_runs >= 4
 
     breakout_needed = False
     if cycles_with_summaries >= 8:
@@ -635,6 +677,18 @@ def collect_context(
                 "explicit head/decoder modification",
                 "training budget increase (epochs/max_train_batches/max_eval_batches)",
                 "data-centric preprocessing/augmentation redesign",
+            ],
+        },
+        "exploration_cadence_context": {
+            "recent_training_runs_8": int(sum(1 for x in recent_training_window if x)),
+            "consecutive_training_runs": consecutive_training_runs,
+            "cycles_since_last_web_search": cycles_since_last_web_search,
+            "research_pass_due": research_pass_due,
+            "non_training_cycle_due": non_training_cycle_due,
+            "recommended_non_training_actions": [
+                "deeper dataset quality/split analysis and update data_exploration.md",
+                "online literature/pattern scan summarized in notes with explicit takeaways",
+                "error analysis on recent outputs to identify dominant failure mode",
             ],
         },
     }
