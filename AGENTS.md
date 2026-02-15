@@ -40,6 +40,21 @@ Primary target is the X-ray fracture challenge training loop.
 3. Record what changed and why in loop events/todo.
 4. Keep improving until explicit stop criteria are met.
 
+## Scientific Working Style (Soft Guidance)
+1. Use hypothesis-driven iteration:
+   - State expected direction before each run (what should improve and why).
+   - After each run, compare expected vs observed behavior.
+2. Always record uncertainty:
+   - Note confidence level and what evidence is still missing.
+   - Flag when a decision is based on noisy or limited validation signal.
+3. Run periodic explore vs exploit self-checks:
+   - If recent cycles are too similar, deliberately explore a different idea class (preprocessing, augmentation, sampling, architecture, or loss design).
+   - If a direction is consistently improving, exploit with controlled follow-ups.
+4. After regressions, write a short failure-analysis note:
+   - Most likely cause.
+   - What was ruled out.
+   - Next best corrective experiment.
+
 ## Initial Execution Agenda
 1. Start with a fast baseline run on the challenge stack to validate pipeline health.
 2. Perform an explicit model-selection bracket before deep tuning:
