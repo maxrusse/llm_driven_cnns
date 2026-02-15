@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import argparse
+import re
 import json
 import os
 import pathlib
 import subprocess
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -78,6 +80,41 @@ def count_jsonl_rows(path: pathlib.Path) -> int:
         return 0
 
 
+def read_recent_jsonl(path: pathlib.Path, max_lines: int = 40) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    lines = tail_text(path, max_bytes=120000).splitlines()
+    out: list[dict[str, Any]] = []
+    for raw in lines[-max_lines:]:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def infer_idea_category(*, rationale: str = "", command: str = "", run_label: str = "") -> str:
+    text = f"{rationale} {command} {run_label}".lower()
+    mapping = [
+        ("augmentation", ["aug", "augmentation", "flip", "rotate", "colorjitter", "albumentation"]),
+        ("preprocessing", ["preprocess", "normaliz", "resize", "crop", "clahe", "window", "histogram"]),
+        ("data_sampling", ["sampl", "class weight", "oversampl", "undersampl", "max_train_batches", "batch"]),
+        ("loss", ["loss", "dice", "focal", "bce", "presence_bce_weight", "weight_decay"]),
+        ("model_arch", ["unet", "deeplab", "resnet", "architecture", "backbone", "encoder", "decoder"]),
+        ("optimization", ["lr", "learning_rate", "scheduler", "cosine", "warmup", "epochs", "optimizer"]),
+        ("evaluation", ["max_eval_batches", "validation", "eval", "threshold", "metric"]),
+    ]
+    for cat, keys in mapping:
+        if any(k in text for k in keys):
+            return cat
+    return "other"
+
+
 def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -99,12 +136,25 @@ def build_output_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["action", "rationale", "command", "run_label", "monitor_seconds", "stop_patterns"],
+        "required": ["action", "rationale", "command", "run_label", "idea_category", "monitor_seconds", "stop_patterns"],
         "properties": {
             "action": {"type": "string", "enum": ["run_command", "stop_current_run", "wait", "shutdown_daemon"]},
             "rationale": {"type": "string"},
             "command": {"type": "string"},
             "run_label": {"type": "string"},
+            "idea_category": {
+                "type": "string",
+                "enum": [
+                    "augmentation",
+                    "preprocessing",
+                    "data_sampling",
+                    "loss",
+                    "model_arch",
+                    "optimization",
+                    "evaluation",
+                    "other",
+                ],
+            },
             "monitor_seconds": {"type": "integer", "minimum": 15, "maximum": 7200},
             "stop_patterns": {
                 "type": "array",
@@ -132,7 +182,15 @@ def build_prompt(
         "When helpful, you may delegate to subagents conceptually; still output one action now.",
         "Use mission/contract text as agenda and execute it step-by-step.",
         "Maintain a running todo in .llm_loop/artifacts/todo.md and update it as work progresses.",
+        "Maintain concise working notes in .llm_loop/artifacts/notes.md (assumptions, dead-ends, next hypotheses).",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
+        "Operate like a data scientist, not only a hyperparameter tuner.",
+        "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
+        "If recent runs repeat one category or metrics stagnate, choose a different category next and state why.",
+        "Always set `idea_category` for your chosen action.",
+        "Before deep tuning, run an explicit model-selection bracket: compare at least 3 architecture/backbone candidates under equal fast budget.",
+        "Do not keep tuning one stack if model-selection is not yet completed.",
+        "After selecting a winner, write `.llm_loop/artifacts/MODEL_SELECTION_DONE.md` with winner + evidence.",
     ]
     if rechallenge_on_done:
         rules.append(
@@ -149,6 +207,11 @@ def build_prompt(
             "stop_current_run": "Stop active process tracked by wrapper.",
             "wait": "No process action this cycle.",
             "shutdown_daemon": "Create stop flag and end daemon loop.",
+        },
+        "artifacts_contract": {
+            "todo": ".llm_loop/artifacts/todo.md",
+            "notes": ".llm_loop/artifacts/notes.md",
+            "condensed_log": ".llm_loop/artifacts/condensed_log.md",
         },
         "defaults": {
             "default_monitor_seconds": default_monitor_seconds,
@@ -222,6 +285,18 @@ def call_codex(
         seen_thread_id = ""
         turn_failed = ""
         event_errors: list[str] = []
+        event_counts: Counter[str] = Counter()
+        item_type_counts: Counter[str] = Counter()
+        tool_signals: set[str] = set()
+        used_web_search = False
+        parsed_event_lines = 0
+
+        logs_dir = workspace_root / ".llm_loop" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        trace_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        trace_path = logs_dir / f"{trace_stamp}_codex_events.jsonl"
+        trace_path.write_text(proc.stdout or "", encoding="utf-8")
+
         for raw_line in (proc.stdout or "").splitlines():
             line = raw_line.strip()
             if not line:
@@ -230,20 +305,44 @@ def call_codex(
                 evt = json.loads(line)
             except Exception:
                 continue
+            parsed_event_lines += 1
             evt_type = str(evt.get("type", ""))
+            if evt_type:
+                event_counts[evt_type] += 1
+            evt_dump = json.dumps(evt, ensure_ascii=True).lower()
+            if any(tok in evt_dump for tok in ("web_search", "search_query", "image_query", "internet")):
+                used_web_search = True
+            for mcp_name in re.findall(r"mcp__[a-z0-9_:.\\-]+", evt_dump):
+                tool_signals.add(mcp_name)
+            for field in ("tool_name", "name", "server_name", "connector_name"):
+                v = evt.get(field)
+                if isinstance(v, str) and v.strip():
+                    tool_signals.add(v.strip())
+
             if evt_type == "thread.started":
                 seen_thread_id = str(evt.get("thread_id", "")).strip()
             elif evt_type == "item.completed":
                 item = evt.get("item")
-                if isinstance(item, dict) and item.get("type") == "agent_message":
-                    msg = item.get("text")
-                    if isinstance(msg, str):
-                        try:
-                            obj = json.loads(msg)
-                        except Exception:
-                            continue
-                        if isinstance(obj, dict):
-                            parsed_result = obj
+                if isinstance(item, dict):
+                    item_type = str(item.get("type", "")).strip()
+                    if item_type:
+                        item_type_counts[item_type] += 1
+                    item_dump = json.dumps(item, ensure_ascii=True).lower()
+                    if any(tok in item_dump for tok in ("web_search", "search_query", "image_query", "internet")):
+                        used_web_search = True
+                    for field in ("tool_name", "name", "server_name", "connector_name"):
+                        v = item.get(field)
+                        if isinstance(v, str) and v.strip():
+                            tool_signals.add(v.strip())
+                    if item.get("type") == "agent_message":
+                        msg = item.get("text")
+                        if isinstance(msg, str):
+                            try:
+                                obj = json.loads(msg)
+                            except Exception:
+                                continue
+                            if isinstance(obj, dict):
+                                parsed_result = obj
             elif evt_type == "turn.failed":
                 err = evt.get("error")
                 if isinstance(err, dict):
@@ -253,10 +352,20 @@ def call_codex(
                 if msg:
                     event_errors.append(msg)
 
+        codex_telemetry = {
+            "trace_file": str(trace_path),
+            "event_counts": dict(event_counts),
+            "item_type_counts": dict(item_type_counts),
+            "parsed_event_lines": parsed_event_lines,
+            "used_web_search": used_web_search,
+            "tool_signals": sorted(tool_signals)[:24],
+        }
+
         if seen_thread_id:
             thread_id_file.parent.mkdir(parents=True, exist_ok=True)
             thread_id_file.write_text(seen_thread_id, encoding="utf-8")
         if parsed_result is not None:
+            parsed_result["__codex_telemetry"] = codex_telemetry
             return parsed_result
         details = []
         if turn_failed:
@@ -277,6 +386,7 @@ def call_codex(
             "stderr": proc.stderr,
             "turn_failed": turn_failed,
             "event_errors": event_errors,
+            "codex_telemetry": codex_telemetry,
         }
         fail_log.write_text(json.dumps(fail_payload, ensure_ascii=True, indent=2), encoding="utf-8")
         if not details:
@@ -296,6 +406,8 @@ def collect_context(
     loop_dir = workspace_root / ".llm_loop"
     logs_dir = loop_dir / "logs"
     events_path = logs_dir / "events.jsonl"
+    summaries_path = logs_dir / "cycle_summaries.jsonl"
+    model_selection_marker = loop_dir / "artifacts" / "MODEL_SELECTION_DONE.md"
     latest_logs = []
     for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:6]:
         latest_logs.append(
@@ -313,6 +425,38 @@ def collect_context(
     if active and not active_live:
         active = None
 
+    recent_events = read_recent_jsonl(events_path, max_lines=24)
+    recent_categories: list[str] = []
+    for e in recent_events:
+        cat = str(e.get("idea_category", "")).strip().lower()
+        if not cat:
+            cat = infer_idea_category(
+                rationale=str(e.get("rationale", "")),
+                command=str(e.get("command_preview", "")),
+                run_label=str(e.get("run_label", "")),
+            )
+        recent_categories.append(cat)
+    distinct_recent_categories = len({c for c in recent_categories if c})
+    repeated_category_streak = 0
+    if recent_categories:
+        last_cat = recent_categories[-1]
+        for c in reversed(recent_categories):
+            if c == last_cat:
+                repeated_category_streak += 1
+            else:
+                break
+
+    recent_summaries = read_recent_jsonl(summaries_path, max_lines=20)
+    non_improving_streak = 0
+    for s in reversed(recent_summaries):
+        d = safe_float(s.get("delta_best_val_dice_pos"))
+        if d is None:
+            continue
+        if d > 0:
+            break
+        non_improving_streak += 1
+    diversify_hint = repeated_category_streak >= 3 or non_improving_streak >= 3
+
     return {
         "time_utc": utc_now(),
         "workspace_root": str(workspace_root),
@@ -326,6 +470,35 @@ def collect_context(
         "mission_text": read_text_head(mission_path, max_chars=12000),
         "todo_file": str(loop_dir / "artifacts" / "todo.md"),
         "todo_text": read_text_head(loop_dir / "artifacts" / "todo.md", max_chars=8000),
+        "notes_file": str(loop_dir / "artifacts" / "notes.md"),
+        "notes_text": read_text_head(loop_dir / "artifacts" / "notes.md", max_chars=8000),
+        "condensed_log_file": str(loop_dir / "artifacts" / "condensed_log.md"),
+        "condensed_log_tail": read_text_head(loop_dir / "artifacts" / "condensed_log.md", max_chars=6000),
+        "model_selection": {
+            "marker_file": str(model_selection_marker),
+            "completed": model_selection_marker.exists(),
+            "candidates_hint": [
+                "simple_unet",
+                "deeplabv3_resnet50",
+                "unet_resnet34",
+            ],
+        },
+        "exploration_context": {
+            "recent_idea_categories": recent_categories[-8:],
+            "distinct_recent_categories": distinct_recent_categories,
+            "repeated_category_streak": repeated_category_streak,
+            "non_improving_streak": non_improving_streak,
+            "diversify_hint": diversify_hint,
+            "target_categories": [
+                "preprocessing",
+                "augmentation",
+                "data_sampling",
+                "loss",
+                "model_arch",
+                "optimization",
+                "evaluation",
+            ],
+        },
     }
 
 
@@ -472,8 +645,13 @@ def extract_epoch_rows(stdout_log: pathlib.Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for raw in tail_text(stdout_log, max_bytes=400000).splitlines():
         line = raw.strip()
-        if not line.startswith("{") or "'epoch':" not in line:
+        idx = line.find("{'epoch':")
+        if idx < 0:
             continue
+        line = line[idx:]
+        end_idx = line.rfind("}")
+        if end_idx > 0:
+            line = line[: end_idx + 1]
         try:
             obj = ast.literal_eval(line)
         except Exception:
@@ -508,17 +686,12 @@ def metric_short(row: dict[str, Any] | None) -> str:
     )
 
 
-def write_cycle_summary(
+def build_quality_evidence(
     *,
-    workspace_root: pathlib.Path,
-    cycle_index: int,
     cycle_result: dict[str, Any],
-    run_label: str,
-    monitor_seconds: int,
     previous_last_completed: Any,
     state: dict[str, Any],
-) -> pathlib.Path:
-    now_utc = utc_now()
+) -> dict[str, Any]:
     run_outcome = cycle_result.get("run_outcome") if isinstance(cycle_result.get("run_outcome"), dict) else {}
     current_log = None
     if isinstance(run_outcome, dict):
@@ -536,12 +709,51 @@ def write_cycle_summary(
     current_best, current_latest = best_and_latest(current_rows)
     prev_best, _ = best_and_latest(prev_rows)
 
-    delta_txt = "n/a"
     current_best_dice = safe_float(current_best.get("val_dice_pos")) if current_best else None
     prev_best_dice = safe_float(prev_best.get("val_dice_pos")) if prev_best else None
+    delta = None
     if current_best_dice is not None and prev_best_dice is not None:
         delta = current_best_dice - prev_best_dice
-        delta_txt = f"{delta:+.3f}"
+
+    return {
+        "run_outcome": run_outcome,
+        "current_log": str(current_log) if current_log else "",
+        "previous_log": str(prev_log) if prev_log else "",
+        "current_rows_count": len(current_rows),
+        "previous_rows_count": len(prev_rows),
+        "current_best": current_best,
+        "current_latest": current_latest,
+        "previous_best": prev_best,
+        "current_best_dice": current_best_dice,
+        "previous_best_dice": prev_best_dice,
+        "delta_best_dice": delta,
+    }
+
+
+def write_cycle_summary(
+    *,
+    workspace_root: pathlib.Path,
+    cycle_index: int,
+    cycle_result: dict[str, Any],
+    run_label: str,
+    monitor_seconds: int,
+    previous_last_completed: Any,
+    state: dict[str, Any],
+    codex_telemetry: dict[str, Any],
+) -> pathlib.Path:
+    now_utc = utc_now()
+    evidence = build_quality_evidence(
+        cycle_result=cycle_result,
+        previous_last_completed=previous_last_completed,
+        state=state,
+    )
+    run_outcome = evidence["run_outcome"] if isinstance(evidence["run_outcome"], dict) else {}
+    current_best = evidence["current_best"] if isinstance(evidence["current_best"], dict) else None
+    current_latest = evidence["current_latest"] if isinstance(evidence["current_latest"], dict) else None
+    current_best_dice = safe_float(evidence.get("current_best_dice"))
+    prev_best_dice = safe_float(evidence.get("previous_best_dice"))
+    delta = safe_float(evidence.get("delta_best_dice"))
+    delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
 
     run_status = "n/a"
     if isinstance(run_outcome, dict):
@@ -559,15 +771,26 @@ def write_cycle_summary(
     if len(rationale) > 280:
         rationale = rationale[:277] + "..."
 
+    event_counts = codex_telemetry.get("event_counts", {}) if isinstance(codex_telemetry, dict) else {}
+    parsed_events = int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0
+    used_web_search = bool(codex_telemetry.get("used_web_search", False)) if isinstance(codex_telemetry, dict) else False
+    tool_signals = codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else []
+    if not isinstance(tool_signals, list):
+        tool_signals = []
+    tool_short = ", ".join(str(x) for x in tool_signals[:4]) if tool_signals else "none"
+    trace_file = str(codex_telemetry.get("trace_file", "n/a")) if isinstance(codex_telemetry, dict) else "n/a"
+
     lines = [
         f"# Cycle Summary {cycle_index}",
         "",
         f"- Time (UTC): {now_utc}",
-        f"- Decision: action={cycle_result.get('action', 'n/a')}, result={cycle_result.get('result', 'n/a')}, run_label={run_label}",
+        f"- Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, result={cycle_result.get('result', 'n/a')}, run_label={run_label}",
         f"- Why: {rationale or 'n/a'}",
         f"- Run state: outcome={run_status}, active_run={active_txt}, monitor_seconds={monitor_seconds}",
-        f"- Quality snapshot: best_this_run[{metric_short(current_best)}] | latest_seen[{metric_short(current_latest)}]",
+        f"- Quality snapshot: rows_parsed={evidence.get('current_rows_count', 0)}; best_this_run[{metric_short(current_best)}] | latest_seen[{metric_short(current_latest)}]",
         f"- Delta vs previous completed run (best val_dice_pos): {delta_txt}",
+        f"- LLM work evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tool_signals={tool_short}",
+        f"- Codex trace: {trace_file}",
     ]
     summary_md = "\n".join(lines) + "\n"
 
@@ -591,10 +814,140 @@ def write_cycle_summary(
             "summary_file": str(cycle_file),
             "best_val_dice_pos": current_best_dice,
             "prev_best_val_dice_pos": prev_best_dice,
-            "delta_best_val_dice_pos": None if current_best_dice is None or prev_best_dice is None else current_best_dice - prev_best_dice,
+            "delta_best_val_dice_pos": delta,
+            "rows_parsed": int(evidence.get("current_rows_count", 0)),
+            "used_web_search": used_web_search,
+            "codex_event_counts": event_counts,
+            "tool_signals": tool_signals[:12],
         },
     )
     return latest_file
+
+
+def write_storyline(
+    *,
+    workspace_root: pathlib.Path,
+    cycle_index: int,
+    cycle_result: dict[str, Any],
+    run_label: str,
+    monitor_seconds: int,
+    previous_last_completed: Any,
+    state: dict[str, Any],
+    codex_telemetry: dict[str, Any],
+) -> pathlib.Path:
+    now_utc = utc_now()
+    evidence = build_quality_evidence(
+        cycle_result=cycle_result,
+        previous_last_completed=previous_last_completed,
+        state=state,
+    )
+    current_best = evidence["current_best"] if isinstance(evidence["current_best"], dict) else None
+    current_latest = evidence["current_latest"] if isinstance(evidence["current_latest"], dict) else None
+    delta = safe_float(evidence.get("delta_best_dice"))
+    run_outcome = evidence["run_outcome"] if isinstance(evidence["run_outcome"], dict) else {}
+
+    rationale = str(cycle_result.get("rationale", "")).strip()
+    if len(rationale) > 300:
+        rationale = rationale[:297] + "..."
+    command_preview = str(cycle_result.get("command_preview", "")).strip()
+    if len(command_preview) > 220:
+        command_preview = command_preview[:217] + "..."
+
+    parsed_events = int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0
+    used_web_search = bool(codex_telemetry.get("used_web_search", False)) if isinstance(codex_telemetry, dict) else False
+    tool_signals = codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else []
+    if not isinstance(tool_signals, list):
+        tool_signals = []
+    tool_short = ", ".join(str(x) for x in tool_signals[:5]) if tool_signals else "none"
+
+    outcome_txt = "n/a"
+    if isinstance(run_outcome, dict):
+        outcome_txt = str(run_outcome.get("status", "n/a"))
+        if "exit_code" in run_outcome:
+            outcome_txt += f" (exit={run_outcome.get('exit_code')})"
+    delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
+    next_txt = "continue rechallenge loop" if str(cycle_result.get("result", "")) == "run_command" else "await next signal"
+
+    lines = [
+        f"## Cycle {cycle_index:04d} | {now_utc}",
+        f"1. Situation: active_run={str(state.get('active_run') is not None).lower()}, last_result={cycle_result.get('result', 'n/a')}",
+        f"2. Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, run_label={run_label}, why={rationale or 'n/a'}",
+        f"3. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
+        f"4. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
+        f"5. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
+        f"6. Next checkpoint: {next_txt}",
+        "",
+    ]
+
+    artifacts_dir = workspace_root / ".llm_loop" / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    storyline_file = artifacts_dir / "storyline.md"
+    if not storyline_file.exists():
+        storyline_file.write_text("# LLM Work Storyline\n\n", encoding="utf-8")
+    with storyline_file.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return storyline_file
+
+
+def append_condensed_log(
+    *,
+    workspace_root: pathlib.Path,
+    cycle_index: int,
+    cycle_result: dict[str, Any],
+    run_label: str,
+    previous_last_completed: Any,
+    state: dict[str, Any],
+    codex_telemetry: dict[str, Any],
+) -> pathlib.Path:
+    now_utc = utc_now()
+    evidence = build_quality_evidence(
+        cycle_result=cycle_result,
+        previous_last_completed=previous_last_completed,
+        state=state,
+    )
+    best = evidence["current_best"] if isinstance(evidence["current_best"], dict) else None
+    latest = evidence["current_latest"] if isinstance(evidence["current_latest"], dict) else None
+    delta = safe_float(evidence.get("delta_best_dice"))
+    delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
+    best_txt = format_num(safe_float(best.get("val_dice_pos")) if best else None)
+    latest_txt = format_num(safe_float(latest.get("val_dice_pos")) if latest else None)
+
+    run_outcome = cycle_result.get("run_outcome")
+    status_txt = "n/a"
+    if isinstance(run_outcome, dict):
+        status_txt = str(run_outcome.get("status", "n/a"))
+        if run_outcome.get("exit_code") is not None:
+            status_txt += f":{run_outcome.get('exit_code')}"
+    used_web = bool(codex_telemetry.get("used_web_search", False)) if isinstance(codex_telemetry, dict) else False
+    parsed_events = int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0
+    rationale = str(cycle_result.get("rationale", "")).strip().replace("\n", " ")
+    if len(rationale) > 120:
+        rationale = rationale[:117] + "..."
+    line = (
+        f"- {now_utc} | c{cycle_index:04d} | {cycle_result.get('action','n/a')}:{cycle_result.get('idea_category','n/a')} "
+        f"| {run_label} | {status_txt} | best={best_txt} latest={latest_txt} d={delta_txt} "
+        f"| rows={evidence.get('current_rows_count',0)} web={str(used_web).lower()} events={parsed_events} | {rationale}"
+    )
+
+    artifacts_dir = workspace_root / ".llm_loop" / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    condensed_file = artifacts_dir / "condensed_log.md"
+    if not condensed_file.exists():
+        condensed_file.write_text("# Condensed Log\n\n", encoding="utf-8")
+    with condensed_file.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+    # Keep this file readable by capping to latest ~220 lines plus header.
+    try:
+        lines = condensed_file.read_text(encoding="utf-8").splitlines()
+        header = lines[:2] if len(lines) >= 2 else ["# Condensed Log", ""]
+        body = lines[2:]
+        if len(body) > 220:
+            body = body[-220:]
+        condensed_file.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return condensed_file
 
 
 def main() -> None:
@@ -690,10 +1043,14 @@ def main() -> None:
         prompt=prompt,
         output_schema=build_output_schema(),
     )
+    codex_telemetry = decision.pop("__codex_telemetry", {}) if isinstance(decision, dict) else {}
 
     action = str(decision.get("action", "wait"))
     command = str(decision.get("command", "")).strip()
     run_label = str(decision.get("run_label", "run")).strip() or "run"
+    idea_category = str(decision.get("idea_category", "")).strip().lower()
+    if not idea_category:
+        idea_category = infer_idea_category(rationale=str(decision.get("rationale", "")), command=command, run_label=run_label)
     monitor_seconds = int(decision.get("monitor_seconds", default_monitor_seconds))
     monitor_seconds = max(15, min(max_monitor_seconds, monitor_seconds))
     stop_patterns = decision.get("stop_patterns", [])
@@ -706,7 +1063,14 @@ def main() -> None:
     cycle_result: dict[str, Any] = {
         "ts_utc": utc_now(),
         "action": action,
+        "idea_category": idea_category,
         "rationale": rationale,
+        "codex": {
+            "used_web_search": bool(codex_telemetry.get("used_web_search", False)),
+            "parsed_event_lines": int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0,
+            "trace_file": str(codex_telemetry.get("trace_file", "")) if isinstance(codex_telemetry, dict) else "",
+            "tool_signals": codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else [],
+        },
     }
 
     active = state.get("active_run")
@@ -736,6 +1100,14 @@ def main() -> None:
         cycle_result["forced_bootstrap"] = True
         state["bootstrap_attempted"] = True
         state["bootstrap_attempts"] = bootstrap_attempts + 1
+        cycle_result["idea_category"] = infer_idea_category(
+            rationale=cycle_result.get("rationale", ""),
+            command=command,
+            run_label=run_label,
+        )
+
+    if command:
+        cycle_result["command_preview"] = command[:260]
 
     if action == "shutdown_daemon":
         stop_daemon_flag.parent.mkdir(parents=True, exist_ok=True)
@@ -804,10 +1176,38 @@ def main() -> None:
             monitor_seconds=monitor_seconds,
             previous_last_completed=previous_last_completed,
             state=state,
+            codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},
         )
         cycle_result["summary_file"] = str(summary_file)
     except Exception as exc:
         cycle_result["summary_error"] = str(exc)
+    try:
+        storyline_file = write_storyline(
+            workspace_root=workspace_root,
+            cycle_index=cycle_index,
+            cycle_result=cycle_result,
+            run_label=run_label,
+            monitor_seconds=monitor_seconds,
+            previous_last_completed=previous_last_completed,
+            state=state,
+            codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},
+        )
+        cycle_result["storyline_file"] = str(storyline_file)
+    except Exception as exc:
+        cycle_result["storyline_error"] = str(exc)
+    try:
+        condensed_file = append_condensed_log(
+            workspace_root=workspace_root,
+            cycle_index=cycle_index,
+            cycle_result=cycle_result,
+            run_label=run_label,
+            previous_last_completed=previous_last_completed,
+            state=state,
+            codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},
+        )
+        cycle_result["condensed_log_file"] = str(condensed_file)
+    except Exception as exc:
+        cycle_result["condensed_log_error"] = str(exc)
 
     write_json(state_file, state)
     append_jsonl(events_file, cycle_result)

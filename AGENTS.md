@@ -42,8 +42,12 @@ Primary target is the X-ray fracture challenge training loop.
 
 ## Initial Execution Agenda
 1. Start with a fast baseline run on the challenge stack to validate pipeline health.
-2. Then iterate with targeted rechallenges focused on metric improvement.
-3. Keep each rechallenge change deliberate and traceable.
+2. Perform an explicit model-selection bracket before deep tuning:
+   - Compare at least 3 architecture/backbone candidates under equal fast budget.
+   - Select winner based on validation evidence.
+   - Record winner in `.llm_loop/artifacts/MODEL_SELECTION_DONE.md`.
+3. Then iterate with targeted rechallenges focused on metric improvement.
+4. Keep each rechallenge change deliberate and traceable.
 
 ## Subagent Note
 The planner prompt explicitly allows Codex to delegate to subagents when that improves execution quality.
