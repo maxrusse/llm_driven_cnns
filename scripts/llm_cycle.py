@@ -197,14 +197,27 @@ def build_prompt(
         "Use mission/contract text as agenda and execute it step-by-step.",
         "Maintain a running todo in .llm_loop/artifacts/todo.md and update it as work progresses.",
         "Maintain concise working notes in .llm_loop/artifacts/notes.md (assumptions, dead-ends, next hypotheses).",
+        "Maintain/update .llm_loop/artifacts/data_exploration.md as a living dataset understanding document.",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
         "Operate like a data scientist, not only a hyperparameter tuner.",
         "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
         "If recent runs repeat one category or metrics stagnate, choose a different category next and state why.",
         "Always set `idea_category` for your chosen action.",
         "Use a lightweight discovery flow: baseline -> inspect data -> quick online search for relevant strong approaches -> targeted experiments.",
+        "Use fast-dev only for initial orientation (about 1-2 cycles) to verify pipeline and learn data behavior.",
+        "After initial orientation, shift to stronger experiments and avoid lingering in tiny-budget fast-dev loops.",
+        "When unresolved, do regular online research passes and adapt generic strong patterns to this task.",
+        "Keep a dual objective: improve segmentation overlap and push fracture-presence classification metrics toward domain-competitive (SOTA-like) ranges.",
+        "Track and discuss classification behavior explicitly (presence precision/recall and calibration), not only segmentation dice.",
+        "Use online references to anchor what strong classification performance looks like in this domain, then adapt pragmatically.",
+        "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
+        "In data exploration, include split/leakage checks, label quality checks, resolution/view heterogeneity, and positive-case strata analysis.",
+        "Translate data findings into concrete hypotheses and experiments; do not stay in threshold/LR tuning only.",
         "Architecture probes are optional (1-2 quick probes when uncertainty is high), not mandatory before data-centric work.",
         "Shift early into data-centric exploration: include preprocessing and augmentation or data_sampling ideas before many optimizer micro-tweaks.",
+        "Fast-dev settings are for scouting only; promote promising recipes to stronger budgets quickly (more epochs/batches and broader eval) when signal is flat.",
+        "When breakout_context.breakout_needed is true, prioritize structural experiments over micro-tuning: larger supported backbones/models, head/decoder changes, and training-budget increases.",
+        "Avoid local tuning traps: when breakout_context.breakout_needed is true, do not spend more than two consecutive cycles on threshold-only or LR-only tweaks.",
         "Keep tone practical and concise in rationale; avoid over-planning.",
         "Hard constraint: do not execute nnU-Net/nnUNet/nnUNetv2 pipelines here (reserved for separate manual comparison).",
         "When using internet research, extract generic strategy patterns and evidence quality signals; do not copy a turnkey pipeline verbatim.",
@@ -217,6 +230,7 @@ def build_prompt(
     prompt = {
         "role": "Autonomous CNN experiment driver",
         "mission": "Keep control of CNN experiments. Decide what to run, when to stop, and when to wait.",
+        "dataset_domain": "X-ray fracture segmentation (medical imaging).",
         "run_id": run_id,
         "rules": rules,
         "action_contract": {
@@ -228,6 +242,7 @@ def build_prompt(
         "artifacts_contract": {
             "todo": ".llm_loop/artifacts/todo.md",
             "notes": ".llm_loop/artifacts/notes.md",
+            "data_exploration": ".llm_loop/artifacts/data_exploration.md",
             "condensed_log": ".llm_loop/artifacts/condensed_log.md",
         },
         "defaults": {
@@ -472,6 +487,7 @@ def collect_context(
                 break
 
     recent_summaries = read_recent_jsonl(summaries_path, max_lines=20)
+    long_summaries = read_recent_jsonl(summaries_path, max_lines=260)
     non_improving_streak = 0
     for s in reversed(recent_summaries):
         d = safe_float(s.get("delta_best_val_dice_pos"))
@@ -481,6 +497,72 @@ def collect_context(
             break
         non_improving_streak += 1
     diversify_hint = repeated_category_streak >= 3 or non_improving_streak >= 3
+
+    cycles_with_summaries = len(long_summaries)
+    best_val_dice_overall: float | None = None
+    best_cycle_overall: int | None = None
+    best_run_label_overall = ""
+    latest_cycle: int | None = None
+    latest_best_val_dice: float | None = None
+    for idx, s in enumerate(long_summaries, start=1):
+        cyc = int(safe_float(s.get("cycle")) or idx)
+        latest_cycle = cyc
+        latest_best_val_dice = safe_float(s.get("best_val_dice_pos"))
+        v = latest_best_val_dice
+        if v is None:
+            continue
+        if best_val_dice_overall is None or v > best_val_dice_overall:
+            best_val_dice_overall = v
+            best_cycle_overall = cyc
+            best_run_label_overall = str(s.get("run_label", ""))
+
+    cycles_since_best: int | None = None
+    if best_cycle_overall is not None and latest_cycle is not None:
+        cycles_since_best = max(0, latest_cycle - best_cycle_overall)
+
+    recent_window = recent_categories[-8:] if recent_categories else []
+    micro_tune_categories = {"evaluation", "optimization", "loss", "data_sampling"}
+    structural_categories = {"model_arch", "preprocessing", "augmentation"}
+    micro_tune_count = sum(1 for c in recent_window if c in micro_tune_categories)
+    structural_count = sum(1 for c in recent_window if c in structural_categories)
+    micro_tuning_drift = len(recent_window) >= 6 and micro_tune_count >= 6 and structural_count <= 2
+
+    model_mentions: Counter[str] = Counter()
+    for e in recent_events[-14:]:
+        txt = " ".join(
+            [
+                str(e.get("run_label", "")),
+                str(e.get("command_preview", "")),
+                str(e.get("rationale", "")),
+            ]
+        ).lower()
+        for model_key in ("simple_unet", "deeplabv3_resnet50", "unet_resnet34"):
+            if model_key in txt:
+                model_mentions[model_key] += 1
+    dominant_model = ""
+    dominant_model_ratio = 0.0
+    if model_mentions:
+        dominant_model, dom_count = model_mentions.most_common(1)[0]
+        dominant_model_ratio = float(dom_count) / float(sum(model_mentions.values()))
+
+    recent_event_window = recent_events[-8:] if recent_events else []
+    recent_web_search_count = 0
+    for e in recent_event_window:
+        c = e.get("codex")
+        if isinstance(c, dict) and bool(c.get("used_web_search", False)):
+            recent_web_search_count += 1
+    online_research_needed = cycles_with_summaries >= 3 and recent_web_search_count == 0
+    orientation_phase_limit = 2
+    orientation_phase_over = cycles_with_summaries > orientation_phase_limit
+
+    breakout_needed = False
+    if cycles_with_summaries >= 8:
+        if non_improving_streak >= 5:
+            breakout_needed = True
+        if micro_tuning_drift:
+            breakout_needed = True
+        if dominant_model_ratio >= 0.70 and non_improving_streak >= 3:
+            breakout_needed = True
 
     return {
         "time_utc": utc_now(),
@@ -497,6 +579,8 @@ def collect_context(
         "todo_text": read_text_head(loop_dir / "artifacts" / "todo.md", max_chars=8000),
         "notes_file": str(loop_dir / "artifacts" / "notes.md"),
         "notes_text": read_text_head(loop_dir / "artifacts" / "notes.md", max_chars=8000),
+        "data_exploration_file": str(loop_dir / "artifacts" / "data_exploration.md"),
+        "data_exploration_text": read_text_head(loop_dir / "artifacts" / "data_exploration.md", max_chars=10000),
         "condensed_log_file": str(loop_dir / "artifacts" / "condensed_log.md"),
         "condensed_log_tail": read_text_head(loop_dir / "artifacts" / "condensed_log.md", max_chars=6000),
         "architecture_probe": {
@@ -523,6 +607,34 @@ def collect_context(
                 "model_arch",
                 "optimization",
                 "evaluation",
+            ],
+        },
+        "performance_context": {
+            "cycles_with_summaries": cycles_with_summaries,
+            "latest_cycle": latest_cycle,
+            "latest_best_val_dice_pos": latest_best_val_dice,
+            "best_val_dice_pos_overall": best_val_dice_overall,
+            "best_cycle_overall": best_cycle_overall,
+            "best_run_label_overall": best_run_label_overall,
+            "cycles_since_best": cycles_since_best,
+            "orientation_phase_limit_cycles": orientation_phase_limit,
+            "orientation_phase_over": orientation_phase_over,
+            "recent_web_search_count_8": recent_web_search_count,
+            "online_research_needed": online_research_needed,
+        },
+        "breakout_context": {
+            "breakout_needed": breakout_needed,
+            "non_improving_streak": non_improving_streak,
+            "micro_tuning_drift": micro_tuning_drift,
+            "recent_micro_tune_count": micro_tune_count,
+            "recent_structural_count": structural_count,
+            "dominant_model_hint": dominant_model,
+            "dominant_model_ratio": dominant_model_ratio,
+            "suggested_structural_moves": [
+                "larger supported backbone or architecture variant",
+                "explicit head/decoder modification",
+                "training budget increase (epochs/max_train_batches/max_eval_batches)",
+                "data-centric preprocessing/augmentation redesign",
             ],
         },
     }

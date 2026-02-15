@@ -9,6 +9,7 @@ Primary target is the X-ray fracture challenge training loop.
 - Workspace root: `C:\Users\Max\code\llm_driven_cnns`
 - Data source (read-only): `C:\Users\Max\code\xray_fracture_benchmark\data`
 - Runtime state: `C:\Users\Max\code\llm_driven_cnns\.llm_loop`
+- Dataset domain: X-ray fracture segmentation (medical imaging).
 
 ## Driver Seat Rules
 1. No automatic config auto-selection.
@@ -41,6 +42,24 @@ Primary target is the X-ray fracture challenge training loop.
 3. Record what changed and why in loop events/todo.
 4. Keep improving until explicit stop criteria are met.
 
+## Phase Guidance
+1. Use fast-dev only for early orientation (about 1-2 cycles) to verify pipeline and understand data behavior.
+2. After orientation, move to stronger experiments (larger budget, stronger models/heads, broader eval).
+3. Include recurring online research passes and adapt generic strong patterns to the task.
+4. Keep a dual objective:
+   - improve segmentation quality
+   - push fracture-presence classification performance toward domain-competitive / SOTA-level ranges from literature.
+
+## Data Exploration Depth
+1. Treat the quick audit script as first-pass only, not full dataset understanding.
+2. Build and maintain a richer exploration note in `.llm_loop/artifacts/data_exploration.md`.
+3. Expand exploration over time:
+   - split integrity and leakage risk checks
+   - label quality issues (empty masks, tiny masks, suspicious artifacts)
+   - resolution/aspect/view heterogeneity and preprocessing implications
+   - positive-case strata (fracture size, sparse-mask regimes, hard negatives)
+4. Convert findings into concrete experiment hypotheses, not only hyperparameter tweaks.
+
 ## Scientific Working Style (Soft Guidance)
 1. Use hypothesis-driven iteration:
    - State expected direction before each run (what should improve and why).
@@ -55,10 +74,17 @@ Primary target is the X-ray fracture challenge training loop.
    - Most likely cause.
    - What was ruled out.
    - Next best corrective experiment.
+5. Breakout rule for plateaus (soft but strong):
+   - If recent cycles are flat/regressing and still far below target, prioritize structural changes over threshold/LR micro-tuning.
+   - Structural changes include larger supported backbones, head/decoder adjustments, and training-budget increases (epochs, train/eval batches).
+6. Benchmark awareness:
+   - Use online references to estimate realistic high-performance ranges for this domain.
+   - Track whether current classification metrics (precision/recall/calibration) are approaching those ranges.
 
 ## Initial Execution Agenda
 1. Start with a fast baseline run on the challenge stack to validate pipeline health.
 2. Inspect the data early (class balance, mask quality, obvious edge cases) and write short notes/hypotheses.
+   - Continue deeper data exploration beyond the first audit and keep updating `.llm_loop/artifacts/data_exploration.md`.
 3. Do a quick online scan of strong approaches for similar medical segmentation tasks, then adapt ideas pragmatically.
    - Generic patterns are good; avoid copy-pasting any single turnkey framework recipe.
 4. Run a mixed set of targeted experiments (preprocessing, augmentation, sampling, loss, and architecture as needed), not only optimizer micro-tuning.
