@@ -74,7 +74,7 @@ Continuously audit and translate findings into hypotheses:
 2. Maintain category diversity across: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.
 3. Avoid train-only drift; insert non-training exploration/research cycles.
 4. If plateau/regression persists, prioritize structural moves over threshold/LR micro-tuning.
-5. Treat cadence as adaptive guidance (soft checkpoints), not fixed cycle quotas.
+5. Treat cadence as evidence-driven guidance, not fixed cycle quotas.
 
 ## Research Behavior
 1. Perform regular online research when progress is weak, stalled, or uncertain.

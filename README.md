@@ -62,7 +62,7 @@ Loop mission is now role-separated:
 
 Cadence policy:
 - Adaptive and evidence-driven, not fixed cycle quotas.
-- Loop uses soft priority signals (`research_priority`, `non_training_priority`, `breakout_priority`, TODO pressure).
+- Loop uses priority signals (`research_priority`, `non_training_priority`, `breakout_priority`, TODO pressure).
 - Signals guide decisions; they do not hard-force a specific action.
 
 Configured in `config/daemon_config.json`:

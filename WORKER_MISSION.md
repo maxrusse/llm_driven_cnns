@@ -22,10 +22,10 @@
 3. Re-check `.llm_loop/artifacts/workpad.md` and prior storyline context.
 4. Choose one action from evidence, not repetition.
 
-## Adaptive Checkpoints (Soft)
-- Use cadence hints as priorities, not hard quotas.
+## Cadence Guidance
+- Use cadence hints as priorities, not quotas.
 - Favor non-training or research passes when evidence quality is weak, uncertainty is high, or TODO pressure is high.
-- You may defer a hinted checkpoint when execution risk/time tradeoff is poor, but record the reason in `notes_update`.
+- If you defer a hinted checkpoint, record the reason in `notes_update`.
 
 ## Housekeeping Contract (Required Every Cycle)
 - Update worker artifacts via housekeeping fields:

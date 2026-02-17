@@ -20,9 +20,9 @@
 2. If weak or repetitive: `recommendation=challenge` and provide a full alternative decision.
 3. Ask 1-3 critical questions only when they can change the next action.
 
-## Adaptive Guidance
-- Use soft checkpoints, not rigid cycle quotas.
-- Escalate critique strength when evidence quality is low, unresolved TODO pressure is high, or improvement signal is weak.
+## Cadence Guidance
+- Use evidence quality and risk to drive critique intensity, not rigid cycle quotas.
+- Escalate critique strength when uncertainty is high, unresolved TODO pressure is high, or improvement signal is weak.
 - When stagnation persists, include at least one concrete `model_arch` or structural alternative with expected tradeoff.
 
 ## Evidence Discipline

@@ -641,7 +641,7 @@ def build_prompt(
         "Track and discuss classification behavior explicitly (presence precision/recall and calibration), not only segmentation dice.",
         "Use online references to anchor what strong classification performance looks like in this domain, then adapt pragmatically.",
         "Avoid train-only loops: insert regular non-training cycles for deeper data exploration and literature synthesis.",
-        "Treat exploration_cadence_context cadence flags as soft checkpoints, not hard gates.",
+        "Treat exploration_cadence_context cadence flags as guidance, not hard gates.",
         "When research_priority is high, strongly prefer a web-supported evidence cycle before additional tuning.",
         "When non_training_priority is high, strongly prefer a non-training cycle unless there is a clear execution-critical reason not to.",
         "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
