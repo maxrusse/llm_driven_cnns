@@ -35,6 +35,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def clamp01(v: float) -> float:
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return float(v)
+
+
 def read_json(path: pathlib.Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -633,16 +641,18 @@ def build_prompt(
         "Track and discuss classification behavior explicitly (presence precision/recall and calibration), not only segmentation dice.",
         "Use online references to anchor what strong classification performance looks like in this domain, then adapt pragmatically.",
         "Avoid train-only loops: insert regular non-training cycles for deeper data exploration and literature synthesis.",
-        "If exploration_cadence_context.research_pass_due is true, do web search in this decision cycle before choosing the next command.",
-        "If exploration_cadence_context.non_training_cycle_due is true, choose a non-training run_command this cycle (no scripts/train.py).",
+        "Treat exploration_cadence_context cadence flags as soft checkpoints, not hard gates.",
+        "When research_priority is high, strongly prefer a web-supported evidence cycle before additional tuning.",
+        "When non_training_priority is high, strongly prefer a non-training cycle unless there is a clear execution-critical reason not to.",
         "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
         "In data exploration, include split/leakage checks, label quality checks, resolution/view heterogeneity, and positive-case strata analysis.",
         "Translate data findings into concrete hypotheses and experiments; do not stay in threshold/LR tuning only.",
         "Architecture probes are optional (1-2 quick probes when uncertainty is high), not mandatory before data-centric work.",
         "Shift early into data-centric exploration: include preprocessing and augmentation or data_sampling ideas before many optimizer micro-tweaks.",
         "Fast-dev settings are for scouting only; promote promising recipes to stronger budgets quickly (more epochs/batches and broader eval) when signal is flat.",
-        "When breakout_context.breakout_needed is true, prioritize structural experiments over micro-tuning: larger supported backbones/models, head/decoder changes, and training-budget increases.",
-        "Avoid local tuning traps: when breakout_context.breakout_needed is true, do not spend more than two consecutive cycles on threshold-only or LR-only tweaks.",
+        "When breakout_priority is high, prioritize structural experiments over micro-tuning: supported backbones/models, head/decoder changes, and training-budget increases.",
+        "Avoid local tuning traps by pivoting away from repeated threshold/LR-only tweaks when evidence quality is weak.",
+        "When unresolved_shared_todo_count is high, address high-impact open TODOs promptly and explain deferrals explicitly in housekeeping notes.",
         "Keep tone practical and concise in rationale; avoid over-planning.",
         "Hard constraint: do not execute nnU-Net/nnUNet/nnUNetv2 pipelines here (reserved for separate manual comparison).",
         "When using internet research, extract generic strategy patterns and evidence quality signals; do not copy a turnkey pipeline verbatim.",
@@ -726,10 +736,12 @@ def build_mentor_prompt(
         "Act as a critical but practical mentor reviewing the primary decision.",
         "Role separation is strict: you are advisory and strategic only; do not take execution ownership.",
         "Identify when the plan is too narrow, stuck, or missing evidence.",
+        "Use adaptive guidance, not rigid cadence quotas; judge by evidence quality and risk.",
         "Ask concise critical questions only when they can change the next action.",
         "Your output must be actionable for the worker and wrapper-managed notes/todo artifacts.",
         "If the decision is sound, return recommendation=continue and suggested_decision=null.",
         "If the decision is weak, return recommendation=challenge and provide a full suggested_decision.",
+        "When uncertainty remains after repeated non-improving cycles, propose at least one concrete model_arch alternative with expected tradeoff.",
         "Do not propose forbidden approaches: nnU-Net / nnUNet / nnUNetv2.",
     ]
     if require_web_search:
@@ -774,13 +786,26 @@ def should_run_mentor(
     if mentor_force_when_stuck:
         exploration_cadence = context.get("exploration_cadence_context")
         if isinstance(exploration_cadence, dict):
-            if bool(exploration_cadence.get("research_pass_due", False)):
+            research_priority = safe_float(exploration_cadence.get("research_priority"))
+            non_training_priority = safe_float(exploration_cadence.get("non_training_priority"))
+            todo_pressure = safe_float(exploration_cadence.get("todo_pressure"))
+            if research_priority is not None and research_priority >= 0.75:
+                reasons.append("research_priority_high")
+            elif bool(exploration_cadence.get("research_pass_due", False)):
                 reasons.append("research_pass_due")
-            if bool(exploration_cadence.get("non_training_cycle_due", False)):
+            if non_training_priority is not None and non_training_priority >= 0.75:
+                reasons.append("non_training_priority_high")
+            elif bool(exploration_cadence.get("non_training_cycle_due", False)):
                 reasons.append("non_training_cycle_due")
+            if todo_pressure is not None and todo_pressure >= 0.70:
+                reasons.append("todo_pressure_high")
         breakout_context = context.get("breakout_context")
-        if isinstance(breakout_context, dict) and bool(breakout_context.get("breakout_needed", False)):
-            reasons.append("breakout_needed")
+        if isinstance(breakout_context, dict):
+            breakout_priority = safe_float(breakout_context.get("breakout_priority"))
+            if breakout_priority is not None and breakout_priority >= 0.75:
+                reasons.append("breakout_priority_high")
+            elif bool(breakout_context.get("breakout_needed", False)):
+                reasons.append("breakout_needed")
         mentor_context = context.get("mentor_context")
         if isinstance(mentor_context, dict) and int(mentor_context.get("challenge_streak", 0) or 0) >= 2:
             reasons.append("mentor_challenge_streak")
@@ -1128,8 +1153,22 @@ def collect_context(
         cycles_since_last_web_search += 1
     if not seen_web:
         cycles_since_last_web_search = len(recent_web_flags)
-    research_pass_due = (consecutive_training_runs >= 3 and cycles_since_last_web_search >= 2) or cycles_since_last_web_search >= 4
-    non_training_cycle_due = consecutive_training_runs >= 4
+    unresolved_todo_pressure = clamp01(float(unresolved_shared_todo_count) / 8.0)
+    research_priority = clamp01(
+        0.14 * float(consecutive_training_runs)
+        + 0.12 * float(cycles_since_last_web_search)
+        + 0.08 * float(non_improving_streak)
+        + (0.10 if mentor_search_requirement_unmet else 0.0)
+        + 0.06 * unresolved_todo_pressure
+    )
+    non_training_priority = clamp01(
+        0.16 * float(consecutive_training_runs)
+        + 0.08 * float(non_improving_streak)
+        + 0.12 * (1.0 if micro_tuning_drift else 0.0)
+        + 0.06 * unresolved_todo_pressure
+    )
+    research_pass_due = bool(research_priority >= 0.66)
+    non_training_cycle_due = bool(non_training_priority >= 0.70)
     mentor_challenge_streak = 0
     for rec in reversed(recent_mentor_recommendations):
         if rec == "challenge":
@@ -1137,14 +1176,14 @@ def collect_context(
         else:
             break
 
-    breakout_needed = False
-    if cycles_with_summaries >= 8:
-        if non_improving_streak >= 5:
-            breakout_needed = True
-        if micro_tuning_drift:
-            breakout_needed = True
-        if dominant_model_ratio >= 0.70 and non_improving_streak >= 3:
-            breakout_needed = True
+    breakout_priority = clamp01(
+        (0.28 if cycles_with_summaries >= 8 else 0.0)
+        + 0.06 * float(non_improving_streak)
+        + (0.20 if micro_tuning_drift else 0.0)
+        + (0.18 if dominant_model_ratio >= 0.70 else 0.0)
+        + 0.05 * float(mentor_challenge_streak)
+    )
+    breakout_needed = bool(breakout_priority >= 0.70)
 
     return {
         "time_utc": utc_now(),
@@ -1208,6 +1247,7 @@ def collect_context(
         },
         "breakout_context": {
             "breakout_needed": breakout_needed,
+            "breakout_priority": breakout_priority,
             "non_improving_streak": non_improving_streak,
             "micro_tuning_drift": micro_tuning_drift,
             "recent_micro_tune_count": micro_tune_count,
@@ -1227,6 +1267,9 @@ def collect_context(
             "cycles_since_last_web_search": cycles_since_last_web_search,
             "research_pass_due": research_pass_due,
             "non_training_cycle_due": non_training_cycle_due,
+            "research_priority": research_priority,
+            "non_training_priority": non_training_priority,
+            "todo_pressure": unresolved_todo_pressure,
             "recommended_non_training_actions": [
                 "deeper dataset quality/split analysis and update workpad Data Exploration section",
                 "online literature/pattern scan summarized in workpad Notes with explicit takeaways",

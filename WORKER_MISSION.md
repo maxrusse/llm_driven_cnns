@@ -22,6 +22,11 @@
 3. Re-check `.llm_loop/artifacts/workpad.md` and prior storyline context.
 4. Choose one action from evidence, not repetition.
 
+## Adaptive Checkpoints (Soft)
+- Use cadence hints as priorities, not hard quotas.
+- Favor non-training or research passes when evidence quality is weak, uncertainty is high, or TODO pressure is high.
+- You may defer a hinted checkpoint when execution risk/time tradeoff is poor, but record the reason in `notes_update`.
+
 ## Housekeeping Contract (Required Every Cycle)
 - Update worker artifacts via housekeeping fields:
   - `todo_new`: 0-4 concrete next-step tasks.
@@ -35,6 +40,7 @@
 2. Use `wait` only for active monitoring or explicit evidence-gathering.
 3. On stalled/regressing behavior, prioritize structural moves over micro-tuning.
 4. For each new run, change at least one meaningful factor and state expected effect.
+5. Avoid rigid cycle counting; use confidence in evidence to decide when to pivot.
 
 ## Command Quality Bar
 1. Set workdir/repo context explicitly.

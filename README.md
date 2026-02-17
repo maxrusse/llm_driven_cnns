@@ -60,6 +60,11 @@ Loop mission is now role-separated:
 - Worker mission: `WORKER_MISSION.md`
 - Mentor mission: `MENTOR_MISSION.md`
 
+Cadence policy:
+- Adaptive and evidence-driven, not fixed cycle quotas.
+- Loop uses soft priority signals (`research_priority`, `non_training_priority`, `breakout_priority`, TODO pressure).
+- Signals guide decisions; they do not hard-force a specific action.
+
 Configured in `config/daemon_config.json`:
 - `worker_mission_file`
 - `mentor_mission_file`
@@ -134,3 +139,4 @@ Notes:
   - `mentor_require_web_search`
   - `mentor_model`, `mentor_reasoning_effort`, `mentor_web_search_mode`
 - Mentor telemetry and critique are written into each cycle event under `codex.mentor`.
+- Mentor is expected to propose concrete model-architecture alternatives when stagnation persists, but not on every cycle by default.

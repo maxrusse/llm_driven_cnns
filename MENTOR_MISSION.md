@@ -20,6 +20,11 @@
 2. If weak or repetitive: `recommendation=challenge` and provide a full alternative decision.
 3. Ask 1-3 critical questions only when they can change the next action.
 
+## Adaptive Guidance
+- Use soft checkpoints, not rigid cycle quotas.
+- Escalate critique strength when evidence quality is low, unresolved TODO pressure is high, or improvement signal is weak.
+- When stagnation persists, include at least one concrete `model_arch` or structural alternative with expected tradeoff.
+
 ## Evidence Discipline
 1. Validate claims against current loop artifacts (events, workpad, storyline, shared TODO).
 2. Use online research periodically to calibrate strategy quality and avoid tunnel vision.
