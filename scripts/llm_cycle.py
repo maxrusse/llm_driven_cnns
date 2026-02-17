@@ -18,6 +18,17 @@ FORBIDDEN_EXECUTION_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bpython(?:\.exe)?\s+-m\s+nnunet(?:v2)?\b", "python_module_nnunet"),
     (r"\bnn-u-net\b", "nn-u-net_cli"),
 )
+ACTION_VALUES: tuple[str, ...] = ("run_command", "stop_current_run", "wait", "shutdown_daemon")
+IDEA_CATEGORY_VALUES: tuple[str, ...] = (
+    "augmentation",
+    "preprocessing",
+    "data_sampling",
+    "loss",
+    "model_arch",
+    "optimization",
+    "evaluation",
+    "other",
+)
 
 
 def utc_now() -> str:
@@ -108,6 +119,67 @@ def ensure_workpad_file(loop_dir: pathlib.Path) -> pathlib.Path:
     return workpad_path
 
 
+def ensure_coordination_files(loop_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    artifacts_dir = loop_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    mentor_notes_path = artifacts_dir / "mentor_notes.md"
+    shared_todo_path = artifacts_dir / "shared_todo.md"
+    if not mentor_notes_path.exists():
+        mentor_notes_path.write_text("# Mentor Notes\n\n", encoding="utf-8")
+    if not shared_todo_path.exists():
+        shared_todo_path.write_text("# Shared TODO\n\n", encoding="utf-8")
+    return mentor_notes_path, shared_todo_path
+
+
+def count_unresolved_shared_todos(shared_todo_path: pathlib.Path) -> int:
+    txt = read_text_head(shared_todo_path, max_chars=60000)
+    if not txt:
+        return 0
+    return sum(1 for line in txt.splitlines() if line.strip().startswith("- [ ]"))
+
+
+def append_mentor_coordination_artifacts(
+    *,
+    mentor_notes_path: pathlib.Path,
+    shared_todo_path: pathlib.Path,
+    cycle_index: int,
+    mentor_recommendation: str,
+    mentor_critique: str,
+    mentor_questions: list[str],
+    mentor_notes: str,
+    todo_updates: list[str],
+) -> tuple[int, int]:
+    now_utc = utc_now()
+    note_lines = [
+        f"## Cycle {cycle_index:04d} | {now_utc}",
+        f"- Recommendation: {mentor_recommendation or 'n/a'}",
+        f"- Critique: {mentor_critique or 'n/a'}",
+    ]
+    if mentor_questions:
+        note_lines.append("- Questions:")
+        note_lines.extend([f"  - {q}" for q in mentor_questions[:3]])
+    if mentor_notes:
+        note_lines.append(f"- Notes: {mentor_notes}")
+    note_lines.append("")
+    with mentor_notes_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(note_lines))
+
+    added = 0
+    if todo_updates:
+        with shared_todo_path.open("a", encoding="utf-8") as f:
+            for idx, item in enumerate(todo_updates[:6], start=1):
+                clean = str(item).strip()
+                if not clean:
+                    continue
+                todo_id = f"C{cycle_index:04d}-M{idx:02d}"
+                f.write(f"- [ ] [{todo_id}] mentor: {clean}\n")
+                added += 1
+            if added:
+                f.write("\n")
+    unresolved = count_unresolved_shared_todos(shared_todo_path)
+    return added, unresolved
+
+
 def run_cmd(args: list[str], cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
 
@@ -194,28 +266,19 @@ def kill_pid(pid: int) -> bool:
     return proc.returncode == 0
 
 
-def build_output_schema() -> dict[str, Any]:
+def build_decision_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
         "required": ["action", "rationale", "command", "run_label", "idea_category", "monitor_seconds", "stop_patterns"],
         "properties": {
-            "action": {"type": "string", "enum": ["run_command", "stop_current_run", "wait", "shutdown_daemon"]},
+            "action": {"type": "string", "enum": list(ACTION_VALUES)},
             "rationale": {"type": "string"},
             "command": {"type": "string"},
             "run_label": {"type": "string"},
             "idea_category": {
                 "type": "string",
-                "enum": [
-                    "augmentation",
-                    "preprocessing",
-                    "data_sampling",
-                    "loss",
-                    "model_arch",
-                    "optimization",
-                    "evaluation",
-                    "other",
-                ],
+                "enum": list(IDEA_CATEGORY_VALUES),
             },
             "monitor_seconds": {"type": "integer", "minimum": 15, "maximum": 7200},
             "stop_patterns": {
@@ -224,6 +287,78 @@ def build_output_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
             },
         },
+    }
+
+
+def build_output_schema() -> dict[str, Any]:
+    return build_decision_schema()
+
+
+def build_mentor_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["recommendation", "critique", "questions", "mentor_notes", "todo_updates", "suggested_decision"],
+        "properties": {
+            "recommendation": {"type": "string", "enum": ["continue", "challenge"]},
+            "critique": {"type": "string"},
+            "questions": {
+                "type": "array",
+                "maxItems": 3,
+                "items": {"type": "string"},
+            },
+            "mentor_notes": {"type": "string"},
+            "todo_updates": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string"},
+            },
+            "suggested_decision": {
+                "anyOf": [
+                    {"type": "null"},
+                    build_decision_schema(),
+                ]
+            },
+        },
+    }
+
+
+def coerce_decision(
+    raw_decision: Any,
+    *,
+    default_monitor_seconds: int,
+    max_monitor_seconds: int,
+) -> dict[str, Any]:
+    raw = raw_decision if isinstance(raw_decision, dict) else {}
+    action = str(raw.get("action", "wait")).strip().lower()
+    if action not in ACTION_VALUES:
+        action = "wait"
+    command = str(raw.get("command", "")).strip()
+    run_label = str(raw.get("run_label", "run")).strip() or "run"
+    rationale = str(raw.get("rationale", "")).strip()
+    idea_category = str(raw.get("idea_category", "")).strip().lower()
+    if idea_category not in IDEA_CATEGORY_VALUES:
+        idea_category = infer_idea_category(rationale=rationale, command=command, run_label=run_label)
+    if idea_category not in IDEA_CATEGORY_VALUES:
+        idea_category = "other"
+    monitor_seconds_raw = raw.get("monitor_seconds", default_monitor_seconds)
+    try:
+        monitor_seconds = int(monitor_seconds_raw)
+    except Exception:
+        monitor_seconds = int(default_monitor_seconds)
+    monitor_seconds = max(15, min(max_monitor_seconds, monitor_seconds))
+    stop_patterns = raw.get("stop_patterns", [])
+    if not isinstance(stop_patterns, list):
+        stop_patterns = []
+    stop_patterns_out = [str(x) for x in stop_patterns][:8]
+    return {
+        "action": action,
+        "command": command,
+        "run_label": run_label,
+        "rationale": rationale,
+        "idea_category": idea_category,
+        "monitor_seconds": monitor_seconds,
+        "stop_patterns": stop_patterns_out,
     }
 
 
@@ -246,6 +381,11 @@ def build_prompt(
         "At the start of every cycle, re-check runtime status: active_run, last_completed_run, and recent events before deciding.",
         "Re-check mission goals each cycle against mission_text; if goals and action diverge, correct course now.",
         "Re-read .llm_loop/artifacts/storyline.md and .llm_loop/artifacts/workpad.md when uncertain or stuck, then decide using already-completed work as evidence.",
+        "Use mentor_context when present: if recent mentor feedback challenged your direction, address it explicitly before repeating similar commands.",
+        "If mentor_context.search_requirement_unmet is true, run a web-search-supported cycle before another training-heavy command.",
+        "Role separation: worker owns analysis/exploration/training execution; mentor owns critique only.",
+        "Check .llm_loop/artifacts/shared_todo.md each cycle; prioritize unresolved mentor items when they are high-impact and evidence-seeking.",
+        "Use .llm_loop/artifacts/workpad.md as worker-owned notes; do not repurpose mentor notes as execution logs.",
         "Maintain one structured workspace file at .llm_loop/artifacts/workpad.md.",
         "Inside workpad.md, keep sections for TODO, Notes, and Data Exploration updated with concise UTC-stamped entries.",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
@@ -312,6 +452,90 @@ def build_prompt(
         "runtime_context": context,
     }
     return json.dumps(prompt, ensure_ascii=True)
+
+
+def build_mentor_prompt(
+    *,
+    run_id: str,
+    context: dict[str, Any],
+    primary_decision: dict[str, Any],
+    require_web_search: bool,
+) -> str:
+    review_context = {
+        "time_utc": context.get("time_utc"),
+        "active_run": context.get("active_run"),
+        "last_completed_run": context.get("last_completed_run"),
+        "exploration_context": context.get("exploration_context"),
+        "performance_context": context.get("performance_context"),
+        "breakout_context": context.get("breakout_context"),
+        "exploration_cadence_context": context.get("exploration_cadence_context"),
+        "mentor_context": context.get("mentor_context"),
+        "coordination_context": context.get("coordination_context"),
+        "workpad_text": context.get("workpad_text", ""),
+        "mentor_notes_tail": context.get("mentor_notes_tail", ""),
+        "shared_todo_tail": context.get("shared_todo_tail", ""),
+        "storyline_tail": context.get("storyline_tail", ""),
+        "recent_events_tail": context.get("recent_events_tail", ""),
+    }
+    rules = [
+        "Act as a critical but practical mentor reviewing the primary decision.",
+        "Role separation is strict: you are advisory and strategic only; do not take execution ownership.",
+        "Identify when the plan is too narrow, stuck, or missing evidence.",
+        "Ask concise critical questions only when they can change the next action.",
+        "Your output must be actionable for the worker and wrapper-managed notes/todo artifacts.",
+        "If the decision is sound, return recommendation=continue and suggested_decision=null.",
+        "If the decision is weak, return recommendation=challenge and provide a full suggested_decision.",
+        "Do not propose forbidden approaches: nnU-Net / nnUNet / nnUNetv2.",
+    ]
+    if require_web_search:
+        rules.append("Before final recommendation, run at least one web search and use it to validate or challenge the plan.")
+
+    prompt = {
+        "role": "Critical mentor for autonomous CNN experimentation loop",
+        "run_id": run_id,
+        "rules": rules,
+        "review_contract": {
+            "recommendation": "continue or challenge",
+            "critique": "short practical critique; include what is risky or missing",
+            "questions": "up to 3 critical questions",
+            "mentor_notes": "short note for mentor_notes.md (advisory only)",
+            "todo_updates": "0-6 concrete TODO items for shared_todo.md",
+            "suggested_decision": "null when continue; full decision object when challenge",
+        },
+        "primary_decision": primary_decision,
+        "runtime_context": review_context,
+    }
+    return json.dumps(prompt, ensure_ascii=True)
+
+
+def should_run_mentor(
+    *,
+    mentor_enabled: bool,
+    cycle_index: int,
+    mentor_every_n_cycles: int,
+    mentor_force_when_stuck: bool,
+    context: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    if not mentor_enabled:
+        return False, ["mentor_disabled"]
+    reasons: list[str] = []
+    n = max(1, int(mentor_every_n_cycles))
+    if cycle_index % n == 0:
+        reasons.append(f"cadence_every_{n}")
+    if mentor_force_when_stuck:
+        exploration_cadence = context.get("exploration_cadence_context")
+        if isinstance(exploration_cadence, dict):
+            if bool(exploration_cadence.get("research_pass_due", False)):
+                reasons.append("research_pass_due")
+            if bool(exploration_cadence.get("non_training_cycle_due", False)):
+                reasons.append("non_training_cycle_due")
+        breakout_context = context.get("breakout_context")
+        if isinstance(breakout_context, dict) and bool(breakout_context.get("breakout_needed", False)):
+            reasons.append("breakout_needed")
+        mentor_context = context.get("mentor_context")
+        if isinstance(mentor_context, dict) and int(mentor_context.get("challenge_streak", 0) or 0) >= 2:
+            reasons.append("mentor_challenge_streak")
+    return bool(reasons), (reasons if reasons else ["not_due"])
 
 
 def call_codex(
@@ -501,7 +725,9 @@ def collect_context(
     summaries_path = logs_dir / "cycle_summaries.jsonl"
     model_selection_marker = artifacts_dir / "MODEL_SELECTION_DONE.md"
     workpad_path = ensure_workpad_file(loop_dir)
+    mentor_notes_path, shared_todo_path = ensure_coordination_files(loop_dir)
     storyline_path = artifacts_dir / "storyline.md"
+    unresolved_shared_todo_count = count_unresolved_shared_todos(shared_todo_path)
     latest_logs = []
     for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:6]:
         latest_logs.append(
@@ -523,6 +749,10 @@ def collect_context(
     recent_categories: list[str] = []
     recent_training_flags: list[bool] = []
     recent_web_flags: list[bool] = []
+    recent_mentor_recommendations: list[str] = []
+    mentor_search_requirement_unmet = False
+    last_mentor_critique = ""
+    last_mentor_questions: list[str] = []
     for e in recent_events:
         cat = str(e.get("idea_category", "")).strip().lower()
         if not cat:
@@ -538,6 +768,21 @@ def collect_context(
         codex_info = e.get("codex")
         web_used = bool(codex_info.get("used_web_search", False)) if isinstance(codex_info, dict) else False
         recent_web_flags.append(web_used)
+        mentor_info = codex_info.get("mentor") if isinstance(codex_info, dict) else None
+        if isinstance(mentor_info, dict) and bool(mentor_info.get("run", False)):
+            rec = str(mentor_info.get("recommendation", "")).strip().lower()
+            if rec:
+                recent_mentor_recommendations.append(rec)
+            if bool(mentor_info.get("search_requirement_met", True)) is False:
+                mentor_search_requirement_unmet = True
+            critique = str(mentor_info.get("critique", "")).strip()
+            if critique:
+                last_mentor_critique = critique
+            q = mentor_info.get("questions", [])
+            if isinstance(q, list):
+                questions = [str(x).strip() for x in q if str(x).strip()][:3]
+                if questions:
+                    last_mentor_questions = questions
     distinct_recent_categories = len({c for c in recent_categories if c})
     repeated_category_streak = 0
     if recent_categories:
@@ -635,6 +880,12 @@ def collect_context(
         cycles_since_last_web_search = len(recent_web_flags)
     research_pass_due = (consecutive_training_runs >= 3 and cycles_since_last_web_search >= 2) or cycles_since_last_web_search >= 4
     non_training_cycle_due = consecutive_training_runs >= 4
+    mentor_challenge_streak = 0
+    for rec in reversed(recent_mentor_recommendations):
+        if rec == "challenge":
+            mentor_challenge_streak += 1
+        else:
+            break
 
     breakout_needed = False
     if cycles_with_summaries >= 8:
@@ -658,6 +909,10 @@ def collect_context(
         "mission_text": read_text_head(mission_path, max_chars=12000),
         "workpad_file": str(workpad_path),
         "workpad_text": read_text_head(workpad_path, max_chars=20000),
+        "mentor_notes_file": str(mentor_notes_path),
+        "mentor_notes_tail": read_text_head(mentor_notes_path, max_chars=12000),
+        "shared_todo_file": str(shared_todo_path),
+        "shared_todo_tail": read_text_head(shared_todo_path, max_chars=12000),
         "storyline_file": str(storyline_path),
         "storyline_tail": read_text_head(storyline_path, max_chars=9000),
         "architecture_probe": {
@@ -725,6 +980,20 @@ def collect_context(
                 "online literature/pattern scan summarized in workpad Notes with explicit takeaways",
                 "error analysis on recent outputs to identify dominant failure mode",
             ],
+        },
+        "mentor_context": {
+            "recent_recommendations": recent_mentor_recommendations[-6:],
+            "challenge_streak": mentor_challenge_streak,
+            "search_requirement_unmet": mentor_search_requirement_unmet,
+            "last_critique": last_mentor_critique,
+            "last_questions": last_mentor_questions,
+            "unresolved_shared_todo_count": unresolved_shared_todo_count,
+        },
+        "coordination_context": {
+            "worker_owned_workpad": str(workpad_path),
+            "mentor_owned_notes": str(mentor_notes_path),
+            "shared_todo": str(shared_todo_path),
+            "unresolved_shared_todo_count": unresolved_shared_todo_count,
         },
     }
 
@@ -1063,6 +1332,10 @@ def write_storyline(
     if not isinstance(tool_signals, list):
         tool_signals = []
     tool_short = ", ".join(str(x) for x in tool_signals[:5]) if tool_signals else "none"
+    mentor_info = {}
+    codex_info = cycle_result.get("codex")
+    if isinstance(codex_info, dict) and isinstance(codex_info.get("mentor"), dict):
+        mentor_info = codex_info.get("mentor") or {}
 
     outcome_txt = "n/a"
     if isinstance(run_outcome, dict):
@@ -1071,6 +1344,22 @@ def write_storyline(
             outcome_txt += f" (exit={run_outcome.get('exit_code')})"
     delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
     next_txt = "continue rechallenge loop" if str(cycle_result.get("result", "")) == "run_command" else "await next signal"
+    mentor_txt = "mentor=skipped"
+    if mentor_info:
+        mentor_txt = (
+            "mentor="
+            + ("run" if bool(mentor_info.get("run", False)) else "not_due")
+            + ", rec="
+            + (str(mentor_info.get("recommendation", "")).strip() or "n/a")
+            + ", applied="
+            + str(bool(mentor_info.get("applied", False))).lower()
+            + ", search_ok="
+            + str(bool(mentor_info.get("search_requirement_met", True))).lower()
+            + ", todo_added="
+            + str(int(mentor_info.get("shared_todo_added", 0) or 0))
+            + ", todo_open="
+            + str(int(mentor_info.get("shared_todo_unresolved", 0) or 0))
+        )
 
     lines = [
         f"## Cycle {cycle_index:04d} | {now_utc}",
@@ -1079,7 +1368,8 @@ def write_storyline(
         f"3. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
         f"4. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
         f"5. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
-        f"6. Next checkpoint: {next_txt}",
+        f"6. Mentor: {mentor_txt}",
+        f"7. Next checkpoint: {next_txt}",
         "",
     ]
 
@@ -1143,10 +1433,25 @@ def main() -> None:
     force_bootstrap_if_idle = bool(cfg.get("force_bootstrap_if_idle", False))
     bootstrap_command = str(cfg.get("bootstrap_command", "")).strip()
     bootstrap_label = str(cfg.get("bootstrap_label", "bootstrap")).strip() or "bootstrap"
+    mentor_enabled = bool(cfg.get("mentor_enabled", False))
+    mentor_model = str(cfg.get("mentor_model", model)).strip() or model
+    mentor_reasoning_effort = str(cfg.get("mentor_reasoning_effort", reasoning_effort)).strip() or reasoning_effort
+    mentor_web_search_mode = str(cfg.get("mentor_web_search_mode", web_search_mode)).strip() or web_search_mode
+    mentor_network_access_enabled = bool(cfg.get("mentor_network_access_enabled", network_access_enabled))
+    mentor_force_when_stuck = bool(cfg.get("mentor_force_when_stuck", True))
+    mentor_apply_suggestions = bool(cfg.get("mentor_apply_suggestions", True))
+    mentor_require_web_search = bool(cfg.get("mentor_require_web_search", True))
+    try:
+        mentor_every_n_cycles = int(cfg.get("mentor_every_n_cycles", 2))
+    except Exception:
+        mentor_every_n_cycles = 2
+    mentor_every_n_cycles = max(1, mentor_every_n_cycles)
     mission_path = pathlib.Path(mission_file)
     if not mission_path.is_absolute():
         mission_path = workspace_root / mission_path
     codex_home.mkdir(parents=True, exist_ok=True)
+    loop_dir = workspace_root / ".llm_loop"
+    mentor_notes_path, shared_todo_path = ensure_coordination_files(loop_dir)
 
     state = read_json(state_file, {"active_run": None})
     if not isinstance(state, dict):
@@ -1162,6 +1467,14 @@ def main() -> None:
         data_source_root=data_source_root,
         mission_path=mission_path,
     )
+    cycle_index = count_jsonl_rows(events_file) + 1
+    mentor_due, mentor_reasons = should_run_mentor(
+        mentor_enabled=mentor_enabled,
+        cycle_index=cycle_index,
+        mentor_every_n_cycles=mentor_every_n_cycles,
+        mentor_force_when_stuck=mentor_force_when_stuck,
+        context=context,
+    )
     context["bootstrap_command"] = bootstrap_command
     context["bootstrap_label"] = bootstrap_label
     context["force_bootstrap_if_idle"] = force_bootstrap_if_idle
@@ -1173,7 +1486,7 @@ def main() -> None:
         rechallenge_on_done=rechallenge_on_done,
     )
 
-    decision = call_codex(
+    decision_raw = call_codex(
         codex_exe=codex_exe,
         workspace_root=workspace_root,
         thread_id_file=thread_id_file,
@@ -1186,21 +1499,108 @@ def main() -> None:
         prompt=prompt,
         output_schema=build_output_schema(),
     )
-    codex_telemetry = decision.pop("__codex_telemetry", {}) if isinstance(decision, dict) else {}
+    codex_telemetry = decision_raw.pop("__codex_telemetry", {}) if isinstance(decision_raw, dict) else {}
+    primary_decision = coerce_decision(
+        decision_raw,
+        default_monitor_seconds=default_monitor_seconds,
+        max_monitor_seconds=max_monitor_seconds,
+    )
 
-    action = str(decision.get("action", "wait"))
-    command = str(decision.get("command", "")).strip()
-    run_label = str(decision.get("run_label", "run")).strip() or "run"
-    idea_category = str(decision.get("idea_category", "")).strip().lower()
-    if not idea_category:
-        idea_category = infer_idea_category(rationale=str(decision.get("rationale", "")), command=command, run_label=run_label)
-    monitor_seconds = int(decision.get("monitor_seconds", default_monitor_seconds))
-    monitor_seconds = max(15, min(max_monitor_seconds, monitor_seconds))
-    stop_patterns = decision.get("stop_patterns", [])
+    mentor_thread_id_file = thread_id_file.with_name("codex_mentor_thread_id.txt")
+    mentor_telemetry: dict[str, Any] = {}
+    mentor_error = ""
+    mentor_recommendation = ""
+    mentor_critique = ""
+    mentor_questions: list[str] = []
+    mentor_notes_txt = ""
+    mentor_todo_updates: list[str] = []
+    mentor_search_requirement_met = True
+    mentor_applied = False
+    effective_decision = dict(primary_decision)
+
+    if mentor_due:
+        try:
+            mentor_prompt = build_mentor_prompt(
+                run_id=run_id,
+                context=context,
+                primary_decision=primary_decision,
+                require_web_search=mentor_require_web_search,
+            )
+            mentor_out = call_codex(
+                codex_exe=codex_exe,
+                workspace_root=workspace_root,
+                thread_id_file=mentor_thread_id_file,
+                model=mentor_model,
+                reasoning_effort=mentor_reasoning_effort,
+                web_search_mode=mentor_web_search_mode,
+                network_access_enabled=mentor_network_access_enabled,
+                skip_git_repo_check=skip_git_repo_check,
+                codex_home=codex_home,
+                prompt=mentor_prompt,
+                output_schema=build_mentor_output_schema(),
+            )
+            mentor_telemetry = mentor_out.pop("__codex_telemetry", {}) if isinstance(mentor_out, dict) else {}
+            mentor_review = mentor_out if isinstance(mentor_out, dict) else {}
+            mentor_recommendation = str(mentor_review.get("recommendation", "")).strip().lower()
+            mentor_critique = str(mentor_review.get("critique", "")).strip()
+            q_raw = mentor_review.get("questions", [])
+            if isinstance(q_raw, list):
+                mentor_questions = [str(x).strip() for x in q_raw if str(x).strip()][:3]
+            mentor_notes_txt = str(mentor_review.get("mentor_notes", "")).strip()
+            todo_raw = mentor_review.get("todo_updates", [])
+            if isinstance(todo_raw, list):
+                mentor_todo_updates = [str(x).strip() for x in todo_raw if str(x).strip()][:6]
+            if mentor_require_web_search and mentor_network_access_enabled:
+                mentor_search_requirement_met = bool(mentor_telemetry.get("used_web_search", False))
+            if mentor_apply_suggestions and mentor_search_requirement_met and mentor_recommendation == "challenge":
+                suggested_raw = mentor_review.get("suggested_decision")
+                if isinstance(suggested_raw, dict):
+                    suggested = coerce_decision(
+                        suggested_raw,
+                        default_monitor_seconds=default_monitor_seconds,
+                        max_monitor_seconds=max_monitor_seconds,
+                    )
+                    # Protect execution from malformed mentor suggestions.
+                    if not (suggested["action"] == "run_command" and not suggested["command"]):
+                        effective_decision = suggested
+                        mentor_applied = True
+                    else:
+                        mentor_error = "mentor challenge ignored: suggested run_command without command"
+                else:
+                    mentor_error = "mentor challenge ignored: suggested_decision missing"
+        except Exception as exc:
+            mentor_error = str(exc)
+    if mentor_due and mentor_require_web_search and mentor_network_access_enabled and not mentor_search_requirement_met:
+        if mentor_error:
+            mentor_error += " | "
+        mentor_error += "mentor search requirement not met"
+
+    mentor_todo_added = 0
+    unresolved_shared_todo_count = count_unresolved_shared_todos(shared_todo_path)
+    if mentor_due:
+        if mentor_error and not mentor_notes_txt:
+            mentor_notes_txt = "mentor_error: " + mentor_error
+        mentor_todo_added, unresolved_shared_todo_count = append_mentor_coordination_artifacts(
+            mentor_notes_path=mentor_notes_path,
+            shared_todo_path=shared_todo_path,
+            cycle_index=cycle_index,
+            mentor_recommendation=mentor_recommendation or "n/a",
+            mentor_critique=mentor_critique,
+            mentor_questions=mentor_questions,
+            mentor_notes=mentor_notes_txt,
+            todo_updates=mentor_todo_updates,
+        )
+
+    action = str(effective_decision.get("action", "wait"))
+    command = str(effective_decision.get("command", "")).strip()
+    run_label = str(effective_decision.get("run_label", "run")).strip() or "run"
+    idea_category = str(effective_decision.get("idea_category", "")).strip().lower()
+    rationale = str(effective_decision.get("rationale", "")).strip()
+    monitor_seconds = int(effective_decision.get("monitor_seconds", default_monitor_seconds))
+    stop_patterns = effective_decision.get("stop_patterns", [])
     if not isinstance(stop_patterns, list):
         stop_patterns = []
     stop_patterns = [str(x) for x in stop_patterns]
-    rationale = str(decision.get("rationale", "")).strip()
 
     previous_last_completed = state.get("last_completed_run")
     cycle_result: dict[str, Any] = {
@@ -1208,11 +1608,32 @@ def main() -> None:
         "action": action,
         "idea_category": idea_category,
         "rationale": rationale,
+        "decision_source": "mentor" if mentor_applied else "primary",
         "codex": {
             "used_web_search": bool(codex_telemetry.get("used_web_search", False)),
             "parsed_event_lines": int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0,
             "trace_file": str(codex_telemetry.get("trace_file", "")) if isinstance(codex_telemetry, dict) else "",
             "tool_signals": codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else [],
+            "mentor": {
+                "enabled": mentor_enabled,
+                "run": mentor_due,
+                "reasons": mentor_reasons,
+                "recommendation": mentor_recommendation,
+                "applied": mentor_applied,
+                "critique": mentor_critique,
+                "questions": mentor_questions,
+                "require_web_search": mentor_require_web_search,
+                "search_requirement_met": mentor_search_requirement_met,
+                "used_web_search": bool(mentor_telemetry.get("used_web_search", False)) if isinstance(mentor_telemetry, dict) else False,
+                "parsed_event_lines": int(mentor_telemetry.get("parsed_event_lines", 0)) if isinstance(mentor_telemetry, dict) else 0,
+                "trace_file": str(mentor_telemetry.get("trace_file", "")) if isinstance(mentor_telemetry, dict) else "",
+                "tool_signals": mentor_telemetry.get("tool_signals", []) if isinstance(mentor_telemetry, dict) else [],
+                "mentor_notes_file": str(mentor_notes_path),
+                "shared_todo_file": str(shared_todo_path),
+                "shared_todo_added": mentor_todo_added,
+                "shared_todo_unresolved": unresolved_shared_todo_count,
+                "error": mentor_error,
+            },
         },
     }
 
@@ -1317,7 +1738,6 @@ def main() -> None:
     else:
         cycle_result["result"] = "wait"
 
-    cycle_index = count_jsonl_rows(events_file) + 1
     try:
         summary_file = write_cycle_summary(
             workspace_root=workspace_root,
