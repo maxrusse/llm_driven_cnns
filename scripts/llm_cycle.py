@@ -1303,6 +1303,7 @@ def run_new_command(
     stop_flags: list[pathlib.Path],
     stop_patterns: list[str],
     state: dict[str, Any],
+    state_file: pathlib.Path,
     events_path: pathlib.Path,
 ) -> dict[str, Any]:
     logs_dir = workspace_root / ".llm_loop" / "logs"
@@ -1330,6 +1331,7 @@ def run_new_command(
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
     }
+    write_json(state_file, state)
 
     started = time.time()
     killed_reason = ""
@@ -1340,6 +1342,7 @@ def run_new_command(
             out_f.close()
             err_f.close()
             state["active_run"] = None
+            write_json(state_file, state)
             return {
                 "status": "completed",
                 "exit_code": rc,
@@ -1376,6 +1379,7 @@ def run_new_command(
         out_f.close()
         err_f.close()
         state["active_run"] = None
+        write_json(state_file, state)
         append_jsonl(
             events_path,
             {
@@ -2090,6 +2094,7 @@ def main() -> None:
                     stop_flags=[stop_daemon_flag, stop_current_run_flag],
                     stop_patterns=stop_patterns,
                     state=state,
+                    state_file=state_file,
                     events_path=events_file,
                 )
                 cycle_result["result"] = "run_command"
