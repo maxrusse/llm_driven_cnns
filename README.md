@@ -20,6 +20,23 @@ Wait until status shows stopped:
 .\scripts\status.ps1
 ```
 
+## Monitoring
+One-shot status:
+```powershell
+.\scripts\status.ps1
+```
+
+Continuous watch with a fresh screen each refresh:
+```powershell
+.\scripts\watch_status.ps1
+```
+
+Examples:
+```powershell
+.\scripts\watch_status.ps1 -IntervalSeconds 30
+.\scripts\watch_status.ps1 -Once
+```
+
 ## Fresh Reset
 ```powershell
 .\scripts\clean_fresh.ps1
