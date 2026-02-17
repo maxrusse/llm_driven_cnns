@@ -9,6 +9,10 @@ $state = Join-Path $WorkspaceRoot ".llm_loop\\state.json"
 $events = Join-Path $WorkspaceRoot ".llm_loop\\logs\\events.jsonl"
 $storyline = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\storyline.md"
 $workpad = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\workpad.md"
+$stateObj = $null
+if (Test-Path $state) {
+    try { $stateObj = Get-Content -Path $state -Raw | ConvertFrom-Json } catch {}
+}
 
 if (Test-Path $hb) {
     Write-Host "Heartbeat:"
@@ -33,7 +37,20 @@ if (Test-Path $hb) {
         if ($updatedUtc -ne $null) {
             $ageSeconds = [int](([DateTimeOffset]::UtcNow - $updatedUtc).TotalSeconds)
             if ($ageSeconds -gt $staleAfter -and ($hbObj.daemon_status -eq "running" -or $hbObj.daemon_status -eq "degraded")) {
-                Write-Warning ("Heartbeat is stale (" + $ageSeconds + "s old). Daemon likely not running anymore.")
+                $activePid = $null
+                $activeRunAlive = $false
+                if ($stateObj -and $stateObj.active_run -and $stateObj.active_run.pid) {
+                    $activePid = [int]$stateObj.active_run.pid
+                    try {
+                        $p = Get-Process -Id $activePid -ErrorAction Stop
+                        if ($null -ne $p) { $activeRunAlive = $true }
+                    } catch {}
+                }
+                if ($activeRunAlive) {
+                    Write-Warning ("Heartbeat is stale (" + $ageSeconds + "s old), but active_run PID " + $activePid + " is alive. Daemon may be inside a long monitor window.")
+                } else {
+                    Write-Warning ("Heartbeat is stale (" + $ageSeconds + "s old). Daemon likely not running anymore.")
+                }
             }
         }
     } catch {}
@@ -44,7 +61,11 @@ if (Test-Path $hb) {
 if (Test-Path $state) {
     Write-Host ""
     Write-Host "State:"
-    Get-Content -Path $state
+    if ($null -ne $stateObj) {
+        $stateObj | ConvertTo-Json -Depth 8
+    } else {
+        Get-Content -Path $state
+    }
 }
 
 if (Test-Path $storyline) {

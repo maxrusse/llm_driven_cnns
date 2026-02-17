@@ -3,6 +3,11 @@
 This file is consumed each cycle by the autonomous wrapper.
 It defines worker-vs-mentor responsibilities, hard constraints, and decision quality standards.
 
+Role-specific mission supplements:
+- Worker: `WORKER_MISSION.md`
+- Mentor: `MENTOR_MISSION.md`
+- If configured, role-specific mission files override this shared contract for role-level guidance.
+
 ## Scope And Paths
 - Wrapper workspace: `C:\Users\Max\code\llm_driven_cnns`
 - Training repo: `C:\Users\Max\code\xray_fracture_benchmark`

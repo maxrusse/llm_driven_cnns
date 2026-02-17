@@ -138,6 +138,112 @@ def count_unresolved_shared_todos(shared_todo_path: pathlib.Path) -> int:
     return sum(1 for line in txt.splitlines() if line.strip().startswith("- [ ]"))
 
 
+def append_entries_to_section(md_path: pathlib.Path, section_title: str, entries: list[str]) -> int:
+    if not entries:
+        return 0
+    txt = md_path.read_text(encoding="utf-8", errors="ignore") if md_path.exists() else ""
+    lines = txt.splitlines()
+    heading = f"## {section_title}"
+    start_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip().lower() == heading.lower():
+            start_idx = i
+            break
+    if start_idx < 0:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(heading)
+        lines.append("")
+        start_idx = len(lines) - 2
+    end_idx = len(lines)
+    for j in range(start_idx + 1, len(lines)):
+        if lines[j].strip().startswith("## "):
+            end_idx = j
+            break
+    insert_at = end_idx
+    if insert_at > 0 and lines[insert_at - 1].strip():
+        lines.insert(insert_at, "")
+        insert_at += 1
+    for e in entries:
+        lines.insert(insert_at, e)
+        insert_at += 1
+    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return len(entries)
+
+
+def resolve_shared_todo_ids(shared_todo_path: pathlib.Path, resolve_ids: list[str], cycle_index: int) -> int:
+    if not resolve_ids or not shared_todo_path.exists():
+        return 0
+    ids = {str(x).strip() for x in resolve_ids if str(x).strip()}
+    if not ids:
+        return 0
+    lines = shared_todo_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    resolved = 0
+    for i, line in enumerate(lines):
+        if "- [ ]" not in line:
+            continue
+        matched_id = None
+        for rid in ids:
+            if f"[{rid}]" in line:
+                matched_id = rid
+                break
+        if not matched_id:
+            continue
+        new_line = line.replace("- [ ]", "- [x]", 1)
+        if "resolved by worker" not in new_line:
+            new_line = new_line + f" (resolved by worker C{cycle_index:04d})"
+        lines[i] = new_line
+        resolved += 1
+    if resolved:
+        shared_todo_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return resolved
+
+
+def append_worker_housekeeping_artifacts(
+    *,
+    workpad_path: pathlib.Path,
+    shared_todo_path: pathlib.Path,
+    cycle_index: int,
+    housekeeping: dict[str, Any],
+) -> dict[str, Any]:
+    hk = housekeeping if isinstance(housekeeping, dict) else {}
+    now_utc = utc_now()
+    todo_new = hk.get("todo_new", [])
+    notes_update = str(hk.get("notes_update", "")).strip()
+    data_update = str(hk.get("data_exploration_update", "")).strip()
+    resolve_ids = hk.get("resolve_shared_todo_ids", [])
+
+    if not isinstance(todo_new, list):
+        todo_new = []
+    if not isinstance(resolve_ids, list):
+        resolve_ids = []
+
+    todo_entries = []
+    todo_seq = 1
+    for item in todo_new[:4]:
+        clean = " ".join(str(item).strip().split())
+        if not clean:
+            continue
+        todo_entries.append(f"- [ ] [C{cycle_index:04d}-W{todo_seq:02d}] {clean[:220]} ({now_utc})")
+        todo_seq += 1
+    notes_entries = [f"- [{now_utc}] {notes_update[:500]}"] if notes_update else []
+    data_entries = [f"- [{now_utc}] {data_update[:500]}"] if data_update else []
+
+    todo_added = append_entries_to_section(workpad_path, "TODO", todo_entries)
+    notes_added = append_entries_to_section(workpad_path, "Notes", notes_entries)
+    data_added = append_entries_to_section(workpad_path, "Data Exploration", data_entries)
+    resolved_shared = resolve_shared_todo_ids(shared_todo_path, [str(x) for x in resolve_ids[:6]], cycle_index)
+    unresolved_after = count_unresolved_shared_todos(shared_todo_path)
+
+    return {
+        "todo_added": todo_added,
+        "notes_added": notes_added,
+        "data_exploration_added": data_added,
+        "shared_todo_resolved": resolved_shared,
+        "shared_todo_unresolved": unresolved_after,
+    }
+
+
 def append_mentor_coordination_artifacts(
     *,
     mentor_notes_path: pathlib.Path,
@@ -270,7 +376,16 @@ def build_decision_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["action", "rationale", "command", "run_label", "idea_category", "monitor_seconds", "stop_patterns"],
+        "required": [
+            "action",
+            "rationale",
+            "command",
+            "run_label",
+            "idea_category",
+            "monitor_seconds",
+            "stop_patterns",
+            "housekeeping",
+        ],
         "properties": {
             "action": {"type": "string", "enum": list(ACTION_VALUES)},
             "rationale": {"type": "string"},
@@ -285,6 +400,25 @@ def build_decision_schema() -> dict[str, Any]:
                 "type": "array",
                 "maxItems": 8,
                 "items": {"type": "string"},
+            },
+            "housekeeping": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["todo_new", "notes_update", "data_exploration_update", "resolve_shared_todo_ids"],
+                "properties": {
+                    "todo_new": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {"type": "string"},
+                    },
+                    "notes_update": {"type": "string"},
+                    "data_exploration_update": {"type": "string"},
+                    "resolve_shared_todo_ids": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
+                },
             },
         },
     }
@@ -351,6 +485,27 @@ def coerce_decision(
     if not isinstance(stop_patterns, list):
         stop_patterns = []
     stop_patterns_out = [str(x) for x in stop_patterns][:8]
+    hk_raw = raw.get("housekeeping", {})
+    if not isinstance(hk_raw, dict):
+        hk_raw = {}
+    todo_new_raw = hk_raw.get("todo_new", [])
+    if not isinstance(todo_new_raw, list):
+        todo_new_raw = []
+    todo_new = []
+    for item in todo_new_raw[:4]:
+        clean = " ".join(str(item).strip().split())
+        if clean:
+            todo_new.append(clean[:220])
+    notes_update = " ".join(str(hk_raw.get("notes_update", "")).strip().split())[:500]
+    data_exploration_update = " ".join(str(hk_raw.get("data_exploration_update", "")).strip().split())[:500]
+    resolve_ids_raw = hk_raw.get("resolve_shared_todo_ids", [])
+    if not isinstance(resolve_ids_raw, list):
+        resolve_ids_raw = []
+    resolve_ids = []
+    for rid in resolve_ids_raw[:6]:
+        token = str(rid).strip()
+        if token:
+            resolve_ids.append(token[:64])
     return {
         "action": action,
         "command": command,
@@ -359,7 +514,82 @@ def coerce_decision(
         "idea_category": idea_category,
         "monitor_seconds": monitor_seconds,
         "stop_patterns": stop_patterns_out,
+        "housekeeping": {
+            "todo_new": todo_new,
+            "notes_update": notes_update,
+            "data_exploration_update": data_exploration_update,
+            "resolve_shared_todo_ids": resolve_ids,
+        },
     }
+
+
+def decision_quality_issues(decision: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    action = str(decision.get("action", "")).strip().lower()
+    rationale = str(decision.get("rationale", "")).strip()
+    run_label = str(decision.get("run_label", "")).strip()
+    command = str(decision.get("command", "")).strip()
+    hk = decision.get("housekeeping", {})
+    if not isinstance(hk, dict):
+        hk = {}
+
+    if len(rationale) < 20:
+        issues.append("rationale_too_short")
+
+    # For routine worker cycles, require at least one concrete housekeeping update.
+    if action in {"run_command", "wait"}:
+        todo_new = hk.get("todo_new", [])
+        resolve_ids = hk.get("resolve_shared_todo_ids", [])
+        notes_update = str(hk.get("notes_update", "")).strip()
+        data_update = str(hk.get("data_exploration_update", "")).strip()
+        if not isinstance(todo_new, list):
+            todo_new = []
+        if not isinstance(resolve_ids, list):
+            resolve_ids = []
+        if not todo_new and not resolve_ids and not notes_update and not data_update:
+            issues.append("housekeeping_empty")
+
+    if action == "run_command":
+        if not command:
+            issues.append("run_command_empty")
+        if run_label in {"", "run"}:
+            issues.append("run_label_generic")
+        cmd_l = command.lower()
+        has_repo_context = ("set-location" in cmd_l) or bool(re.search(r"\bcd\s+", cmd_l))
+        if not has_repo_context:
+            issues.append("run_command_missing_repo_context")
+
+    return issues
+
+
+def apply_decision_quality_gate(decision: dict[str, Any]) -> tuple[dict[str, Any], list[str], bool]:
+    issues = decision_quality_issues(decision)
+    if not issues:
+        return decision, [], False
+    blocked = any(
+        key in issues
+        for key in (
+            "rationale_too_short",
+            "housekeeping_empty",
+            "run_command_empty",
+            "run_label_generic",
+            "run_command_missing_repo_context",
+        )
+    )
+    if not blocked:
+        return decision, issues, False
+
+    blocked_decision = dict(decision)
+    prior_rationale = str(decision.get("rationale", "")).strip()
+    blocked_decision["action"] = "wait"
+    blocked_decision["command"] = ""
+    blocked_decision["run_label"] = "quality_gate_wait"
+    blocked_decision["rationale"] = (
+        ((prior_rationale + " | ") if prior_rationale else "")
+        + "quality gate blocked decision: "
+        + ", ".join(issues[:6])
+    )
+    return blocked_decision, issues, True
 
 
 def build_prompt(
@@ -388,6 +618,8 @@ def build_prompt(
         "Use .llm_loop/artifacts/workpad.md as worker-owned notes; do not repurpose mentor notes as execution logs.",
         "Maintain one structured workspace file at .llm_loop/artifacts/workpad.md.",
         "Inside workpad.md, keep sections for TODO, Notes, and Data Exploration updated with concise UTC-stamped entries.",
+        "Every cycle, provide housekeeping updates in the required `housekeeping` object, even if some fields are empty.",
+        "Resolve shared mentor TODOs when done by listing IDs in housekeeping.resolve_shared_todo_ids.",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
         "Operate like a data scientist, not only a hyperparameter tuner.",
         "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
@@ -426,6 +658,10 @@ def build_prompt(
         "dataset_domain": "X-ray fracture segmentation (medical imaging).",
         "run_id": run_id,
         "rules": rules,
+        "mission_contract": {
+            "worker_mission_file": context.get("mission_file"),
+            "worker_mission_text": context.get("mission_text"),
+        },
         "action_contract": {
             "run_command": "Provide a concrete powershell command in `command` and a short `run_label`.",
             "stop_current_run": "Stop active process tracked by wrapper.",
@@ -435,6 +671,13 @@ def build_prompt(
         "artifacts_contract": {
             "storyline": ".llm_loop/artifacts/storyline.md",
             "workpad": ".llm_loop/artifacts/workpad.md",
+            "shared_todo": ".llm_loop/artifacts/shared_todo.md",
+            "housekeeping_output": {
+                "todo_new": "0-4 concise TODO bullets to append under workpad TODO",
+                "notes_update": "one concise note for workpad Notes (or empty string)",
+                "data_exploration_update": "one concise observation/hypothesis for Data Exploration (or empty string)",
+                "resolve_shared_todo_ids": "0-6 shared TODO IDs to mark resolved (e.g. C0002-M01)",
+            },
         },
         "defaults": {
             "default_monitor_seconds": default_monitor_seconds,
@@ -471,6 +714,8 @@ def build_mentor_prompt(
         "exploration_cadence_context": context.get("exploration_cadence_context"),
         "mentor_context": context.get("mentor_context"),
         "coordination_context": context.get("coordination_context"),
+        "mentor_mission_file": context.get("mentor_mission_file", context.get("mission_file")),
+        "mentor_mission_text": context.get("mentor_mission_text", context.get("mission_text")),
         "workpad_text": context.get("workpad_text", ""),
         "mentor_notes_tail": context.get("mentor_notes_tail", ""),
         "shared_todo_tail": context.get("shared_todo_tail", ""),
@@ -494,6 +739,10 @@ def build_mentor_prompt(
         "role": "Critical mentor for autonomous CNN experimentation loop",
         "run_id": run_id,
         "rules": rules,
+        "mission_contract": {
+            "mentor_mission_file": review_context.get("mentor_mission_file"),
+            "mentor_mission_text": review_context.get("mentor_mission_text"),
+        },
         "review_contract": {
             "recommendation": "continue or challenge",
             "critique": "short practical critique; include what is risky or missing",
@@ -716,7 +965,8 @@ def collect_context(
     workspace_root: pathlib.Path,
     state: dict[str, Any],
     data_source_root: str,
-    mission_path: pathlib.Path,
+    worker_mission_path: pathlib.Path,
+    mentor_mission_path: pathlib.Path,
 ) -> dict[str, Any]:
     loop_dir = workspace_root / ".llm_loop"
     logs_dir = loop_dir / "logs"
@@ -905,8 +1155,10 @@ def collect_context(
         "last_completed_run": state.get("last_completed_run"),
         "recent_events_tail": tail_text(events_path, max_bytes=14000)[-5000:],
         "recent_logs": latest_logs,
-        "mission_file": str(mission_path),
-        "mission_text": read_text_head(mission_path, max_chars=12000),
+        "mission_file": str(worker_mission_path),
+        "mission_text": read_text_head(worker_mission_path, max_chars=12000),
+        "mentor_mission_file": str(mentor_mission_path),
+        "mentor_mission_text": read_text_head(mentor_mission_path, max_chars=12000),
         "workpad_file": str(workpad_path),
         "workpad_text": read_text_head(workpad_path, max_chars=20000),
         "mentor_notes_file": str(mentor_notes_path),
@@ -1333,9 +1585,15 @@ def write_storyline(
         tool_signals = []
     tool_short = ", ".join(str(x) for x in tool_signals[:5]) if tool_signals else "none"
     mentor_info = {}
+    worker_hk_info = {}
+    quality_gate_info = {}
     codex_info = cycle_result.get("codex")
     if isinstance(codex_info, dict) and isinstance(codex_info.get("mentor"), dict):
         mentor_info = codex_info.get("mentor") or {}
+    if isinstance(codex_info, dict) and isinstance(codex_info.get("worker_housekeeping"), dict):
+        worker_hk_info = codex_info.get("worker_housekeeping") or {}
+    if isinstance(cycle_result.get("quality_gate"), dict):
+        quality_gate_info = cycle_result.get("quality_gate") or {}
 
     outcome_txt = "n/a"
     if isinstance(run_outcome, dict):
@@ -1360,16 +1618,46 @@ def write_storyline(
             + ", todo_open="
             + str(int(mentor_info.get("shared_todo_unresolved", 0) or 0))
         )
+    worker_hk_txt = "todo_added=0, notes=0, data=0, resolved=0, shared_open=0"
+    if worker_hk_info:
+        worker_hk_txt = (
+            "todo_added="
+            + str(int(worker_hk_info.get("todo_added", 0) or 0))
+            + ", notes="
+            + str(int(worker_hk_info.get("notes_added", 0) or 0))
+            + ", data="
+            + str(int(worker_hk_info.get("data_exploration_added", 0) or 0))
+            + ", resolved="
+            + str(int(worker_hk_info.get("shared_todo_resolved", 0) or 0))
+            + ", shared_open="
+            + str(int(worker_hk_info.get("shared_todo_unresolved", 0) or 0))
+        )
+    quality_gate_txt = "source=primary, blocked=false, issues=none"
+    if quality_gate_info:
+        issues = quality_gate_info.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        issue_txt = ", ".join(str(x) for x in issues[:4]) if issues else "none"
+        quality_gate_txt = (
+            "source="
+            + str(quality_gate_info.get("source", "primary"))
+            + ", blocked="
+            + str(bool(quality_gate_info.get("blocked", False))).lower()
+            + ", issues="
+            + issue_txt
+        )
 
     lines = [
         f"## Cycle {cycle_index:04d} | {now_utc}",
         f"1. Situation: active_run={str(state.get('active_run') is not None).lower()}, last_result={cycle_result.get('result', 'n/a')}",
         f"2. Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, run_label={run_label}, why={rationale or 'n/a'}",
-        f"3. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
-        f"4. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
-        f"5. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
-        f"6. Mentor: {mentor_txt}",
-        f"7. Next checkpoint: {next_txt}",
+        f"3. Quality gate: {quality_gate_txt}",
+        f"4. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
+        f"5. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
+        f"6. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
+        f"7. Mentor: {mentor_txt}",
+        f"8. Worker housekeeping: {worker_hk_txt}",
+        f"9. Next checkpoint: {next_txt}",
         "",
     ]
 
@@ -1430,6 +1718,8 @@ def main() -> None:
     rechallenge_on_done = bool(cfg.get("rechallenge_on_done", True))
     data_source_root = str(cfg.get("data_source_root", ""))
     mission_file = str(cfg.get("mission_file", "AGENTS.md")).strip() or "AGENTS.md"
+    worker_mission_file = str(cfg.get("worker_mission_file", mission_file)).strip() or mission_file
+    mentor_mission_file = str(cfg.get("mentor_mission_file", mission_file)).strip() or mission_file
     force_bootstrap_if_idle = bool(cfg.get("force_bootstrap_if_idle", False))
     bootstrap_command = str(cfg.get("bootstrap_command", "")).strip()
     bootstrap_label = str(cfg.get("bootstrap_label", "bootstrap")).strip() or "bootstrap"
@@ -1446,9 +1736,14 @@ def main() -> None:
     except Exception:
         mentor_every_n_cycles = 2
     mentor_every_n_cycles = max(1, mentor_every_n_cycles)
-    mission_path = pathlib.Path(mission_file)
-    if not mission_path.is_absolute():
-        mission_path = workspace_root / mission_path
+    worker_mission_path = pathlib.Path(worker_mission_file)
+    if not worker_mission_path.is_absolute():
+        worker_mission_path = workspace_root / worker_mission_path
+    mentor_mission_path = pathlib.Path(mentor_mission_file)
+    if not mentor_mission_path.is_absolute():
+        mentor_mission_path = workspace_root / mentor_mission_path
+    if not mentor_mission_path.exists():
+        mentor_mission_path = worker_mission_path
     codex_home.mkdir(parents=True, exist_ok=True)
     loop_dir = workspace_root / ".llm_loop"
     mentor_notes_path, shared_todo_path = ensure_coordination_files(loop_dir)
@@ -1465,7 +1760,8 @@ def main() -> None:
         workspace_root=workspace_root,
         state=state,
         data_source_root=data_source_root,
-        mission_path=mission_path,
+        worker_mission_path=worker_mission_path,
+        mentor_mission_path=mentor_mission_path,
     )
     cycle_index = count_jsonl_rows(events_file) + 1
     mentor_due, mentor_reasons = should_run_mentor(
@@ -1505,6 +1801,9 @@ def main() -> None:
         default_monitor_seconds=default_monitor_seconds,
         max_monitor_seconds=max_monitor_seconds,
     )
+    primary_quality_issues: list[str] = []
+    primary_quality_blocked = False
+    primary_decision, primary_quality_issues, primary_quality_blocked = apply_decision_quality_gate(primary_decision)
 
     mentor_thread_id_file = thread_id_file.with_name("codex_mentor_thread_id.txt")
     mentor_telemetry: dict[str, Any] = {}
@@ -1517,6 +1816,9 @@ def main() -> None:
     mentor_search_requirement_met = True
     mentor_applied = False
     effective_decision = dict(primary_decision)
+    effective_quality_source = "primary"
+    effective_quality_issues = list(primary_quality_issues)
+    effective_quality_blocked = bool(primary_quality_blocked)
 
     if mentor_due:
         try:
@@ -1560,10 +1862,14 @@ def main() -> None:
                         default_monitor_seconds=default_monitor_seconds,
                         max_monitor_seconds=max_monitor_seconds,
                     )
+                    suggested, suggested_quality_issues, suggested_quality_blocked = apply_decision_quality_gate(suggested)
                     # Protect execution from malformed mentor suggestions.
                     if not (suggested["action"] == "run_command" and not suggested["command"]):
                         effective_decision = suggested
                         mentor_applied = True
+                        effective_quality_source = "mentor_suggested"
+                        effective_quality_issues = list(suggested_quality_issues)
+                        effective_quality_blocked = bool(suggested_quality_blocked)
                     else:
                         mentor_error = "mentor challenge ignored: suggested run_command without command"
                 else:
@@ -1601,6 +1907,16 @@ def main() -> None:
     if not isinstance(stop_patterns, list):
         stop_patterns = []
     stop_patterns = [str(x) for x in stop_patterns]
+    worker_housekeeping = effective_decision.get("housekeeping", {})
+    if not isinstance(worker_housekeeping, dict):
+        worker_housekeeping = {}
+    worker_housekeeping_result = append_worker_housekeeping_artifacts(
+        workpad_path=loop_dir / "artifacts" / "workpad.md",
+        shared_todo_path=shared_todo_path,
+        cycle_index=cycle_index,
+        housekeeping=worker_housekeeping,
+    )
+    unresolved_shared_todo_count = int(worker_housekeeping_result.get("shared_todo_unresolved", unresolved_shared_todo_count))
 
     previous_last_completed = state.get("last_completed_run")
     cycle_result: dict[str, Any] = {
@@ -1609,6 +1925,11 @@ def main() -> None:
         "idea_category": idea_category,
         "rationale": rationale,
         "decision_source": "mentor" if mentor_applied else "primary",
+        "quality_gate": {
+            "source": effective_quality_source,
+            "blocked": bool(effective_quality_blocked),
+            "issues": effective_quality_issues[:8],
+        },
         "codex": {
             "used_web_search": bool(codex_telemetry.get("used_web_search", False)),
             "parsed_event_lines": int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0,
@@ -1633,6 +1954,13 @@ def main() -> None:
                 "shared_todo_added": mentor_todo_added,
                 "shared_todo_unresolved": unresolved_shared_todo_count,
                 "error": mentor_error,
+            },
+            "worker_housekeeping": {
+                "todo_added": int(worker_housekeeping_result.get("todo_added", 0)),
+                "notes_added": int(worker_housekeeping_result.get("notes_added", 0)),
+                "data_exploration_added": int(worker_housekeeping_result.get("data_exploration_added", 0)),
+                "shared_todo_resolved": int(worker_housekeeping_result.get("shared_todo_resolved", 0)),
+                "shared_todo_unresolved": int(worker_housekeeping_result.get("shared_todo_unresolved", unresolved_shared_todo_count)),
             },
         },
     }

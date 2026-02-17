@@ -37,6 +37,62 @@ Examples:
 .\scripts\watch_status.ps1 -Once
 ```
 
+Behavior note (important):
+- Heartbeat (`.llm_loop/logs/daemon_heartbeat.json`) is refreshed after a cycle returns.
+- A `run_command` cycle can monitor a training process for a long window (`monitor_seconds`) before returning.
+- During that window, heartbeat timestamp may look stale even though GPU training is still active.
+
+How to confirm active training:
+```powershell
+# active run metadata (pid/log paths)
+Get-Content .\.llm_loop\state.json
+
+# latest training logs changing over time = run is alive
+Get-ChildItem .\.llm_loop\logs\*xray*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 6 Name,Length,LastWriteTime
+```
+
+Where timing comes from:
+- `daemon_poll_seconds` in `config/daemon_config.json` controls daemon loop sleep between cycles.
+- `monitor_seconds` is chosen per cycle decision (clamped by `default_monitor_seconds` and `max_monitor_seconds` in config).
+
+## Role Contracts
+Loop mission is now role-separated:
+- Worker mission: `WORKER_MISSION.md`
+- Mentor mission: `MENTOR_MISSION.md`
+
+Configured in `config/daemon_config.json`:
+- `worker_mission_file`
+- `mentor_mission_file`
+
+Fallback:
+- `mission_file` remains supported and is used when role-specific files are not set.
+
+Interaction model (SOTA-inspired):
+- **OpenAI handoffs pattern**: keep a clear owner per step, then hand off explicitly when review/critique is needed.
+  - https://openai.github.io/openai-agents-js/guides/handoffs/
+- **Anthropic agent workflow guidance**: keep loops simple, structured, and inspectable before adding complexity.
+  - https://www.anthropic.com/engineering/building-effective-agents
+- **OpenClaw multi-agent architecture**: separate agent responsibilities and shared memory/state for robust long runs.
+  - https://docs.openclaw.ai/home/architecture
+
+## Worker Housekeeping (Per Cycle)
+Worker decision output includes required housekeeping fields. Wrapper writes these into artifacts:
+- `todo_new` -> `.llm_loop/artifacts/workpad.md` (`## TODO`)
+- `notes_update` -> `.llm_loop/artifacts/workpad.md` (`## Notes`)
+- `data_exploration_update` -> `.llm_loop/artifacts/workpad.md` (`## Data Exploration`)
+- `resolve_shared_todo_ids` -> marks matching IDs in `.llm_loop/artifacts/shared_todo.md` as resolved
+
+## Lightweight Quality Gate
+Before execution, wrapper applies a simple decision-quality checklist.
+If violated, the cycle is auto-downgraded to `wait` and reasons are logged.
+
+Current gate checks:
+- rationale should be non-trivial (not very short)
+- housekeeping cannot be fully empty on routine worker cycles (`run_command`/`wait`)
+- `run_command` must include non-empty command, non-generic run label, and explicit repo context (`Set-Location`/`cd`)
+
+Quality gate telemetry appears in cycle events under `quality_gate` and storyline entries.
+
 ## Fresh Reset
 ```powershell
 .\scripts\clean_fresh.ps1
