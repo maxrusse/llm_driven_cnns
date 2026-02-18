@@ -98,6 +98,46 @@ Current gate checks:
 
 Quality gate telemetry appears in cycle events under `quality_gate` and storyline entries.
 
+## Auto Repair (Install + Retry)
+When a run fails, the wrapper can do one automatic recovery pass:
+- Detect known `ModuleNotFoundError` cases from stderr.
+- Install mapped packages into the configured training venv (`auto_repair_python_exe`).
+- If a missing module is not mapped, try a direct package guess (module name / alias mapping).
+- Optionally clone a model source repo and install it into the same training venv.
+- Retry the same command once.
+- If stderr shows `Unsupported model.name` for known aliases (for example `unet_resnet34`), apply a configured fallback model name and retry once.
+- If a model fallback exists, fallback is preferred over blind package install attempts.
+- For `--config`-driven runs, fallback writes a patched YAML copy into `.llm_loop/autofix_configs/` and retries with that file.
+
+Config keys in `config/daemon_config.json`:
+- `auto_repair_enabled`
+- `auto_repair_retry_on_success`
+- `auto_repair_allow_direct_module_install`
+- `auto_repair_python_exe`
+- `auto_repair_module_package_map`
+- `auto_repair_module_alias_map`
+- `auto_repair_module_clone_map`
+- `auto_repair_model_package_map`
+- `auto_repair_model_clone_map`
+- `auto_repair_model_fallback_map`
+
+Clone map format (optional):
+```json
+{
+  "auto_repair_module_clone_map": {
+    "some_missing_module": {
+      "repo": "https://github.com/org/repo.git",
+      "ref": "main",
+      "subdir": "",
+      "editable": true
+    }
+  }
+}
+```
+`repo` can also be set as a direct string value.
+
+Auto-repair evidence is written into cycle events under `auto_repair` and retry outcomes under `run_outcome_retry`.
+
 ## Fresh Reset
 ```powershell
 .\scripts\clean_fresh.ps1

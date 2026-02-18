@@ -27,5 +27,59 @@
   "worker_mission_file": "WORKER_MISSION.md",
   "mentor_mission_file": "MENTOR_MISSION.md",
   "python_exe": "C:\\Users\\Max\\code\\llm_driven_cnns_venv\\Scripts\\python.exe",
+  "auto_repair_enabled": true,
+  "auto_repair_retry_on_success": true,
+  "auto_repair_allow_direct_module_install": true,
+  "auto_repair_python_exe": "C:\\Users\\Max\\code\\xray_fracture_benchmark_venv\\Scripts\\python.exe",
+  "auto_repair_module_package_map": {
+    "segmentation_models_pytorch": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "timm": [
+      "timm"
+    ],
+    "einops": [
+      "einops"
+    ],
+    "transformers": [
+      "transformers"
+    ]
+  },
+  "auto_repair_module_alias_map": {
+    "cv2": [
+      "opencv-python"
+    ],
+    "pil": [
+      "pillow"
+    ],
+    "yaml": [
+      "pyyaml"
+    ],
+    "sklearn": [
+      "scikit-learn"
+    ]
+  },
+  "auto_repair_module_clone_map": {},
+  "auto_repair_model_package_map": {
+    "unet_resnet34": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "unet_resnet34_dual": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "unet_resnet34_dual_head": [
+      "segmentation-models-pytorch",
+      "timm"
+    ]
+  },
+  "auto_repair_model_clone_map": {},
+  "auto_repair_model_fallback_map": {
+    "unet_resnet34": "simple_unet",
+    "unet_resnet34_dual": "simple_unet_dual_head",
+    "unet_resnet34_dual_head": "simple_unet_dual_head"
+  },
   "data_source_root": "C:\\Users\\Max\\code\\xray_fracture_benchmark\\data"
 }

@@ -29,6 +29,28 @@ IDEA_CATEGORY_VALUES: tuple[str, ...] = (
     "evaluation",
     "other",
 )
+DEFAULT_AUTO_REPAIR_MODULE_PACKAGE_MAP: dict[str, list[str]] = {
+    "segmentation_models_pytorch": ["segmentation-models-pytorch", "timm"],
+    "timm": ["timm"],
+    "einops": ["einops"],
+    "transformers": ["transformers"],
+}
+DEFAULT_AUTO_REPAIR_MODULE_ALIAS_MAP: dict[str, list[str]] = {
+    "cv2": ["opencv-python"],
+    "pil": ["pillow"],
+    "yaml": ["pyyaml"],
+    "sklearn": ["scikit-learn"],
+}
+DEFAULT_AUTO_REPAIR_MODEL_PACKAGE_MAP: dict[str, list[str]] = {
+    "unet_resnet34": ["segmentation-models-pytorch", "timm"],
+    "unet_resnet34_dual": ["segmentation-models-pytorch", "timm"],
+    "unet_resnet34_dual_head": ["segmentation-models-pytorch", "timm"],
+}
+DEFAULT_AUTO_REPAIR_MODEL_FALLBACK_MAP: dict[str, str] = {
+    "unet_resnet34": "simple_unet",
+    "unet_resnet34_dual": "simple_unet_dual_head",
+    "unet_resnet34_dual_head": "simple_unet_dual_head",
+}
 
 
 def utc_now() -> str:
@@ -1405,6 +1427,568 @@ def run_new_command(
     }
 
 
+def normalize_package_map(raw: Any, defaults: dict[str, list[str]]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {str(k).strip().lower(): [str(x).strip() for x in v if str(x).strip()] for k, v in defaults.items()}
+    if not isinstance(raw, dict):
+        return out
+    for key, val in raw.items():
+        k = str(key).strip().lower()
+        if not k:
+            continue
+        pkgs: list[str] = []
+        if isinstance(val, list):
+            pkgs = [str(x).strip() for x in val if str(x).strip()]
+        elif isinstance(val, str):
+            pkgs = [str(x).strip() for x in val.split() if str(x).strip()]
+        if pkgs:
+            out[k] = pkgs
+    return out
+
+
+def normalize_fallback_map(raw: Any, defaults: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {str(k).strip().lower(): str(v).strip() for k, v in defaults.items() if str(k).strip() and str(v).strip()}
+    if not isinstance(raw, dict):
+        return out
+    for key, val in raw.items():
+        k = str(key).strip().lower()
+        v = str(val).strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def normalize_clone_map(raw: Any) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, val in raw.items():
+        k = str(key).strip().lower()
+        if not k:
+            continue
+        repo = ""
+        ref = ""
+        subdir = ""
+        editable = True
+        if isinstance(val, str):
+            repo = val.strip()
+        elif isinstance(val, dict):
+            repo = str(val.get("repo", "")).strip()
+            ref = str(val.get("ref", "")).strip()
+            subdir = str(val.get("subdir", "")).strip()
+            editable = bool(val.get("editable", True))
+        if not repo:
+            continue
+        out[k] = {"repo": repo, "ref": ref, "subdir": subdir, "editable": editable}
+    return out
+
+
+def extract_python_exe_from_command(command: str) -> str | None:
+    if not command:
+        return None
+    for m in re.finditer(r"['\"]([A-Za-z]:[\\/][^'\"]*python(?:\.exe)?)['\"]", command, flags=re.IGNORECASE):
+        candidate = m.group(1).strip()
+        if candidate and pathlib.Path(candidate).exists():
+            return candidate
+    return None
+
+
+def extract_missing_module(stderr_text: str) -> str | None:
+    if not stderr_text:
+        return None
+    m = re.search(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]", stderr_text)
+    if not m:
+        return None
+    return str(m.group(1)).strip()
+
+
+def extract_unsupported_model_name(stderr_text: str) -> str | None:
+    if not stderr_text:
+        return None
+    m = re.search(r"Unsupported model\.name:\s*([A-Za-z0-9_\-\.]+)", stderr_text)
+    if not m:
+        return None
+    return str(m.group(1)).strip()
+
+
+def infer_direct_module_packages(missing_module: str, alias_map: dict[str, list[str]]) -> list[str]:
+    if not missing_module:
+        return []
+    raw = missing_module.strip()
+    if not raw:
+        return []
+    root = raw.split(".")[0].strip()
+    key = root.lower()
+    if key in alias_map:
+        return [str(x).strip() for x in alias_map[key] if str(x).strip()]
+    candidates: list[str] = []
+    for c in [raw, root, root.replace("_", "-"), raw.replace(".", "-")]:
+        c = str(c).strip()
+        if c and c not in candidates:
+            candidates.append(c)
+    return candidates
+
+
+def apply_model_name_fallback(command: str, unsupported_model: str, fallback_map: dict[str, str]) -> str | None:
+    if not command or not unsupported_model:
+        return None
+    key = unsupported_model.strip().lower()
+    repl = fallback_map.get(key)
+    if not repl:
+        return None
+    patched = command.replace(unsupported_model, repl)
+    if patched != command:
+        return patched
+    patched_ci = re.sub(rf"\b{re.escape(unsupported_model)}\b", repl, command, flags=re.IGNORECASE)
+    if patched_ci != command:
+        return patched_ci
+    return None
+
+
+def extract_command_workdir(command: str) -> pathlib.Path | None:
+    if not command:
+        return None
+    m = re.search(r"(?:Set-Location|cd)\s+['\"]([^'\"]+)['\"]", command, flags=re.IGNORECASE)
+    if not m:
+        return None
+    txt = str(m.group(1)).strip()
+    if not txt:
+        return None
+    try:
+        p = pathlib.Path(txt)
+        if p.exists():
+            return p.resolve()
+        return p
+    except Exception:
+        return None
+
+
+def extract_config_path_token(command: str) -> tuple[str, str] | None:
+    if not command:
+        return None
+    m = re.search(r"--config\s+(?:['\"]([^'\"]+)['\"]|(\S+))", command, flags=re.IGNORECASE)
+    if not m:
+        return None
+    raw = str(m.group(1) or m.group(2) or "").strip()
+    if not raw:
+        return None
+    return raw, raw
+
+
+def patch_model_name_in_yaml_config(
+    *,
+    config_path: pathlib.Path,
+    unsupported_model: str,
+    replacement_model: str,
+    workspace_root: pathlib.Path,
+    run_label: str,
+) -> pathlib.Path | None:
+    if not config_path.exists():
+        return None
+    txt = config_path.read_text(encoding="utf-8", errors="ignore")
+    if not txt.strip():
+        return None
+    pattern = re.compile(
+        rf"(?mi)^(\s*name\s*:\s*)(['\"]?){re.escape(unsupported_model)}(['\"]?)\s*$"
+    )
+    patched_txt, changed = pattern.subn(rf"\1\2{replacement_model}\3", txt, count=1)
+    if changed <= 0:
+        return None
+
+    out_dir = workspace_root / ".llm_loop" / "autofix_configs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in run_label.lower()).strip("-") or "run"
+    safe_model = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in replacement_model.lower()).strip("-") or "model"
+    out_name = f"{ts}_{safe_label}_{config_path.stem}_autofix_{safe_model}{config_path.suffix or '.yaml'}"
+    out_path = out_dir / out_name
+    out_path.write_text(patched_txt, encoding="utf-8")
+    return out_path
+
+
+def apply_model_name_fallback_to_config_command(
+    *,
+    workspace_root: pathlib.Path,
+    command: str,
+    run_label: str,
+    unsupported_model: str,
+    fallback_map: dict[str, str],
+) -> str | None:
+    key = unsupported_model.strip().lower()
+    replacement_model = str(fallback_map.get(key, "")).strip()
+    if not replacement_model:
+        return None
+    token = extract_config_path_token(command)
+    if not token:
+        return None
+    config_arg_raw, config_arg_replace = token
+    command_workdir = extract_command_workdir(command) or workspace_root
+    cfg_path = pathlib.Path(config_arg_raw)
+    if not cfg_path.is_absolute():
+        cfg_path = (command_workdir / cfg_path).resolve()
+    patched_cfg = patch_model_name_in_yaml_config(
+        config_path=cfg_path,
+        unsupported_model=unsupported_model,
+        replacement_model=replacement_model,
+        workspace_root=workspace_root,
+        run_label=run_label,
+    )
+    if not patched_cfg:
+        return None
+    patched_command = command.replace(config_arg_replace, str(patched_cfg), 1)
+    if patched_command == command:
+        return None
+    return patched_command
+
+
+def clone_source_repo(
+    *,
+    workspace_root: pathlib.Path,
+    source_key: str,
+    clone_spec: dict[str, Any],
+    run_label: str,
+) -> dict[str, Any]:
+    logs_dir = workspace_root / ".llm_loop" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in run_label.lower()).strip("-") or "run"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    clone_log = logs_dir / f"{ts}_{safe_label}_autofix_clone.log"
+
+    repo = str(clone_spec.get("repo", "")).strip()
+    ref = str(clone_spec.get("ref", "")).strip()
+    subdir = str(clone_spec.get("subdir", "")).strip()
+    if not repo:
+        return {
+            "attempted": False,
+            "success": False,
+            "error": "missing_repo",
+        }
+
+    safe_key = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in source_key.lower()).strip("-") or "source"
+    sources_root = workspace_root / ".llm_loop" / "model_sources"
+    sources_root.mkdir(parents=True, exist_ok=True)
+    source_dir = sources_root / safe_key
+    install_dir = source_dir / subdir if subdir else source_dir
+
+    if source_dir.exists() and not (source_dir / ".git").exists():
+        clone_log.write_text(
+            "\n".join(
+                [
+                    f"repo={repo}",
+                    f"ref={ref}",
+                    f"source_dir={source_dir}",
+                    "error=source_dir_exists_without_git_repo",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "attempted": True,
+            "success": False,
+            "repo": repo,
+            "ref": ref,
+            "source_dir": str(source_dir),
+            "install_dir": str(install_dir),
+            "log_file": str(clone_log),
+            "error": "source_dir_exists_without_git_repo",
+        }
+
+    commands: list[list[str]] = []
+    if (source_dir / ".git").exists():
+        commands.append(["git", "-C", str(source_dir), "fetch", "--all", "--prune"])
+        if ref:
+            commands.append(["git", "-C", str(source_dir), "checkout", ref])
+            commands.append(["git", "-C", str(source_dir), "pull", "--ff-only", "origin", ref])
+    else:
+        clone_cmd = ["git", "clone", "--depth", "1"]
+        if ref:
+            clone_cmd.extend(["--branch", ref])
+        clone_cmd.extend([repo, str(source_dir)])
+        commands.append(clone_cmd)
+
+    started = utc_now()
+    logs: list[str] = [f"started_utc={started}", f"repo={repo}", f"ref={ref}", f"source_dir={source_dir}"]
+    for cmd in commands:
+        logs.append("")
+        logs.append("command=" + " ".join(cmd))
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(workspace_root),
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            logs.append("[stdout]")
+            logs.append(proc.stdout or "")
+            logs.append("[stderr]")
+            logs.append(proc.stderr or "")
+            logs.append(f"returncode={proc.returncode}")
+            if proc.returncode != 0:
+                clone_log.write_text("\n".join(logs), encoding="utf-8")
+                return {
+                    "attempted": True,
+                    "success": False,
+                    "repo": repo,
+                    "ref": ref,
+                    "source_dir": str(source_dir),
+                    "install_dir": str(install_dir),
+                    "log_file": str(clone_log),
+                    "exit_code": int(proc.returncode),
+                }
+        except Exception as exc:
+            logs.append(f"exception={exc}")
+            clone_log.write_text("\n".join(logs), encoding="utf-8")
+            return {
+                "attempted": True,
+                "success": False,
+                "repo": repo,
+                "ref": ref,
+                "source_dir": str(source_dir),
+                "install_dir": str(install_dir),
+                "log_file": str(clone_log),
+                "error": str(exc),
+                "exit_code": -1,
+            }
+
+    if not install_dir.exists():
+        logs.append(f"error=install_dir_missing:{install_dir}")
+        clone_log.write_text("\n".join(logs), encoding="utf-8")
+        return {
+            "attempted": True,
+            "success": False,
+            "repo": repo,
+            "ref": ref,
+            "source_dir": str(source_dir),
+            "install_dir": str(install_dir),
+            "log_file": str(clone_log),
+            "error": "install_dir_missing",
+        }
+    logs.append(f"ended_utc={utc_now()}")
+    clone_log.write_text("\n".join(logs), encoding="utf-8")
+    return {
+        "attempted": True,
+        "success": True,
+        "repo": repo,
+        "ref": ref,
+        "source_dir": str(source_dir),
+        "install_dir": str(install_dir),
+        "log_file": str(clone_log),
+        "ended_utc": utc_now(),
+    }
+
+
+def install_packages_with_python(
+    *,
+    workspace_root: pathlib.Path,
+    python_exe: str,
+    packages: list[str],
+    run_label: str,
+) -> dict[str, Any]:
+    logs_dir = workspace_root / ".llm_loop" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in run_label.lower()).strip("-") or "run"
+    install_tag = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{safe_label}_autofix_pip"
+    install_log = logs_dir / f"{install_tag}.log"
+
+    cmd = [python_exe, "-m", "pip", "install", "--disable-pip-version-check", *packages]
+    started = utc_now()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workspace_root),
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        install_log.write_text(
+            "\n".join(
+                [
+                    f"started_utc={started}",
+                    f"python_exe={python_exe}",
+                    "command=" + " ".join(cmd),
+                    "",
+                    "[stdout]",
+                    stdout,
+                    "",
+                    "[stderr]",
+                    stderr,
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "attempted": True,
+            "success": proc.returncode == 0,
+            "exit_code": int(proc.returncode),
+            "python_exe": python_exe,
+            "packages": packages,
+            "log_file": str(install_log),
+            "started_utc": started,
+            "ended_utc": utc_now(),
+        }
+    except Exception as exc:
+        install_log.write_text(
+            "\n".join(
+                [
+                    f"started_utc={started}",
+                    f"python_exe={python_exe}",
+                    "command=" + " ".join(cmd),
+                    "",
+                    f"exception={exc}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "attempted": True,
+            "success": False,
+            "exit_code": -1,
+            "python_exe": python_exe,
+            "packages": packages,
+            "log_file": str(install_log),
+            "started_utc": started,
+            "ended_utc": utc_now(),
+            "error": str(exc),
+        }
+
+
+def install_source_with_python(
+    *,
+    workspace_root: pathlib.Path,
+    python_exe: str,
+    source_dir: pathlib.Path,
+    editable: bool,
+    run_label: str,
+) -> dict[str, Any]:
+    packages: list[str] = []
+    if editable:
+        packages.extend(["-e", str(source_dir)])
+    else:
+        packages.append(str(source_dir))
+    return install_packages_with_python(
+        workspace_root=workspace_root,
+        python_exe=python_exe,
+        packages=packages,
+        run_label=run_label,
+    )
+
+
+def attempt_auto_repair(
+    *,
+    workspace_root: pathlib.Path,
+    command: str,
+    run_label: str,
+    stderr_log: pathlib.Path,
+    fallback_python_exe: str,
+    module_package_map: dict[str, list[str]],
+    module_alias_map: dict[str, list[str]],
+    module_clone_map: dict[str, dict[str, Any]],
+    model_package_map: dict[str, list[str]],
+    model_clone_map: dict[str, dict[str, Any]],
+    model_fallback_map: dict[str, str],
+    allow_direct_module_install: bool,
+) -> dict[str, Any] | None:
+    stderr_tail = tail_text(stderr_log, max_bytes=24000)
+    if not stderr_tail:
+        return None
+
+    missing_module = extract_missing_module(stderr_tail)
+    unsupported_model = extract_unsupported_model_name(stderr_tail)
+    packages: list[str] = []
+    reason = ""
+    clone_spec: dict[str, Any] | None = None
+    model_patched_command: str | None = None
+    model_fallback_applied = False
+
+    if missing_module:
+        key = missing_module.strip().lower()
+        reason = f"missing_module:{missing_module}"
+        packages = module_package_map.get(key, [])
+        if not packages and allow_direct_module_install:
+            packages = infer_direct_module_packages(missing_module, module_alias_map)
+        clone_spec = module_clone_map.get(key)
+    elif unsupported_model:
+        key = unsupported_model.strip().lower()
+        reason = f"unsupported_model:{unsupported_model}"
+        model_patched_command = apply_model_name_fallback(command, unsupported_model, model_fallback_map)
+        if not model_patched_command:
+            model_patched_command = apply_model_name_fallback_to_config_command(
+                workspace_root=workspace_root,
+                command=command,
+                run_label=run_label,
+                unsupported_model=unsupported_model,
+                fallback_map=model_fallback_map,
+            )
+        model_fallback_applied = bool(model_patched_command and model_patched_command != command)
+        if not model_fallback_applied:
+            packages = model_package_map.get(key, [])
+            clone_spec = model_clone_map.get(key)
+    else:
+        return None
+
+    python_exe = extract_python_exe_from_command(command) or (fallback_python_exe.strip() if fallback_python_exe else "")
+    python_exe = python_exe.strip()
+    if python_exe and not pathlib.Path(python_exe).exists():
+        python_exe = ""
+
+    out: dict[str, Any] = {
+        "reason": reason or "unknown",
+        "missing_module": missing_module or "",
+        "unsupported_model": unsupported_model or "",
+        "packages": packages,
+        "python_exe": python_exe,
+        "pip": {"attempted": False, "success": False},
+        "clone": {"attempted": False, "success": False},
+        "pip_from_clone": {"attempted": False, "success": False},
+        "model_fallback_applied": model_fallback_applied,
+    }
+    if model_fallback_applied and model_patched_command:
+        out["patched_command"] = model_patched_command
+        out["skip_install_reason"] = "model_fallback_available"
+        return out
+
+    if python_exe and packages:
+        out["pip"] = install_packages_with_python(
+            workspace_root=workspace_root,
+            python_exe=python_exe,
+            packages=packages,
+            run_label=run_label,
+        )
+
+    clone_needed = bool(clone_spec) and bool(python_exe) and not bool((out.get("pip") or {}).get("success", False))
+    if clone_needed and isinstance(clone_spec, dict):
+        clone = clone_source_repo(
+            workspace_root=workspace_root,
+            source_key=missing_module or unsupported_model or "source",
+            clone_spec=clone_spec,
+            run_label=run_label,
+        )
+        out["clone"] = clone
+        if bool(clone.get("success", False)):
+            install_dir_txt = str(clone.get("install_dir", "")).strip()
+            install_dir = pathlib.Path(install_dir_txt) if install_dir_txt else None
+            if install_dir and install_dir.exists():
+                out["pip_from_clone"] = install_source_with_python(
+                    workspace_root=workspace_root,
+                    python_exe=python_exe,
+                    source_dir=install_dir,
+                    editable=bool(clone_spec.get("editable", True)),
+                    run_label=run_label,
+                )
+
+    attempted_any = (
+        bool((out.get("pip") or {}).get("attempted", False))
+        or bool((out.get("clone") or {}).get("attempted", False))
+        or bool((out.get("pip_from_clone") or {}).get("attempted", False))
+        or bool(out.get("model_fallback_applied", False))
+    )
+    if not attempted_any:
+        return None
+    return out
+
+
 def safe_float(v: Any) -> float | None:
     try:
         return float(v)
@@ -1778,6 +2362,32 @@ def main() -> None:
     mentor_force_when_stuck = bool(cfg.get("mentor_force_when_stuck", True))
     mentor_apply_suggestions = bool(cfg.get("mentor_apply_suggestions", True))
     mentor_require_web_search = bool(cfg.get("mentor_require_web_search", True))
+    auto_repair_enabled = bool(cfg.get("auto_repair_enabled", True))
+    auto_repair_retry_on_success = bool(cfg.get("auto_repair_retry_on_success", True))
+    auto_repair_allow_direct_module_install = bool(cfg.get("auto_repair_allow_direct_module_install", True))
+    auto_repair_python_exe = str(cfg.get("auto_repair_python_exe", "")).strip()
+    auto_repair_module_package_map = normalize_package_map(
+        cfg.get("auto_repair_module_package_map"),
+        DEFAULT_AUTO_REPAIR_MODULE_PACKAGE_MAP,
+    )
+    auto_repair_module_alias_map = normalize_package_map(
+        cfg.get("auto_repair_module_alias_map"),
+        DEFAULT_AUTO_REPAIR_MODULE_ALIAS_MAP,
+    )
+    auto_repair_module_clone_map = normalize_clone_map(
+        cfg.get("auto_repair_module_clone_map"),
+    )
+    auto_repair_model_package_map = normalize_package_map(
+        cfg.get("auto_repair_model_package_map"),
+        DEFAULT_AUTO_REPAIR_MODEL_PACKAGE_MAP,
+    )
+    auto_repair_model_clone_map = normalize_clone_map(
+        cfg.get("auto_repair_model_clone_map"),
+    )
+    auto_repair_model_fallback_map = normalize_fallback_map(
+        cfg.get("auto_repair_model_fallback_map"),
+        DEFAULT_AUTO_REPAIR_MODEL_FALLBACK_MAP,
+    )
     try:
         mentor_every_n_cycles = int(cfg.get("mentor_every_n_cycles", 2))
     except Exception:
@@ -2047,6 +2657,8 @@ def main() -> None:
 
     if command:
         cycle_result["command_preview"] = command[:260]
+    final_record_run_label = run_label
+    final_record_command = command
 
     if action == "shutdown_daemon":
         stop_daemon_flag.parent.mkdir(parents=True, exist_ok=True)
@@ -2085,7 +2697,7 @@ def main() -> None:
                 cycle_result["result"] = "active_run_exists"
                 cycle_result["active_pid"] = int(active["pid"])
             else:
-                run_outcome = run_new_command(
+                initial_outcome = run_new_command(
                     workspace_root=workspace_root,
                     command=command,
                     run_label=run_label,
@@ -2097,6 +2709,61 @@ def main() -> None:
                     state_file=state_file,
                     events_path=events_file,
                 )
+                run_outcome = dict(initial_outcome)
+                retry_command = ""
+                retry_run_label = ""
+                status_initial = str(initial_outcome.get("status", ""))
+                exit_initial = initial_outcome.get("exit_code")
+                if auto_repair_enabled and status_initial == "completed" and exit_initial not in (None, 0):
+                    stderr_log_txt = str(initial_outcome.get("stderr_log", "")).strip()
+                    stderr_log_path = pathlib.Path(stderr_log_txt) if stderr_log_txt else None
+                    if stderr_log_path and stderr_log_path.exists():
+                        repair = attempt_auto_repair(
+                            workspace_root=workspace_root,
+                            command=command,
+                            run_label=run_label,
+                            stderr_log=stderr_log_path,
+                            fallback_python_exe=auto_repair_python_exe,
+                            module_package_map=auto_repair_module_package_map,
+                            module_alias_map=auto_repair_module_alias_map,
+                            module_clone_map=auto_repair_module_clone_map,
+                            model_package_map=auto_repair_model_package_map,
+                            model_clone_map=auto_repair_model_clone_map,
+                            model_fallback_map=auto_repair_model_fallback_map,
+                            allow_direct_module_install=auto_repair_allow_direct_module_install,
+                        )
+                        if isinstance(repair, dict):
+                            cycle_result["auto_repair"] = repair
+                            if bool(repair.get("model_fallback_applied", False)) and isinstance(repair.get("patched_command"), str):
+                                retry_command = str(repair.get("patched_command", "")).strip()
+                                retry_run_label = (run_label + "_retry_model_fallback").strip()
+                            elif (
+                                bool((repair.get("pip") or {}).get("attempted", False))
+                                and bool((repair.get("pip") or {}).get("success", False))
+                            ) or (
+                                bool((repair.get("pip_from_clone") or {}).get("attempted", False))
+                                and bool((repair.get("pip_from_clone") or {}).get("success", False))
+                            ):
+                                retry_command = command
+                                retry_run_label = (run_label + "_retry_after_install").strip()
+                if auto_repair_retry_on_success and retry_command and retry_run_label:
+                    retry_outcome = run_new_command(
+                        workspace_root=workspace_root,
+                        command=retry_command,
+                        run_label=retry_run_label,
+                        monitor_seconds=monitor_seconds,
+                        cycle_poll_seconds=cycle_poll_seconds,
+                        stop_flags=[stop_daemon_flag, stop_current_run_flag],
+                        stop_patterns=stop_patterns,
+                        state=state,
+                        state_file=state_file,
+                        events_path=events_file,
+                    )
+                    cycle_result["run_outcome_initial"] = initial_outcome
+                    cycle_result["run_outcome_retry"] = retry_outcome
+                    run_outcome = dict(retry_outcome)
+                    final_record_run_label = retry_run_label
+                    final_record_command = retry_command
                 cycle_result["result"] = "run_command"
                 cycle_result["run_outcome"] = run_outcome
                 status = str(run_outcome.get("status", ""))
@@ -2105,11 +2772,11 @@ def main() -> None:
                     state["last_completed_run"] = {
                         "ended_utc": utc_now(),
                         "status": status,
-                        "run_label": run_label,
-                        "command": command,
+                        "run_label": final_record_run_label,
+                        "command": final_record_command,
                         "outcome": run_outcome,
                     }
-                    if run_label == bootstrap_label:
+                    if final_record_run_label == bootstrap_label:
                         state["bootstrap_successful"] = bool(status == "completed" and exit_code == 0)
     else:
         cycle_result["result"] = "wait"
@@ -2119,7 +2786,7 @@ def main() -> None:
             workspace_root=workspace_root,
             cycle_index=cycle_index,
             cycle_result=cycle_result,
-            run_label=run_label,
+            run_label=final_record_run_label,
             monitor_seconds=monitor_seconds,
             previous_last_completed=previous_last_completed,
             state=state,
@@ -2133,7 +2800,7 @@ def main() -> None:
             workspace_root=workspace_root,
             cycle_index=cycle_index,
             cycle_result=cycle_result,
-            run_label=run_label,
+            run_label=final_record_run_label,
             monitor_seconds=monitor_seconds,
             previous_last_completed=previous_last_completed,
             state=state,
