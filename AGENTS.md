@@ -43,9 +43,9 @@ Role-specific mission supplements:
 
 ## Shared Artifacts
 Update with UTC-stamped concise entries:
-1. `.llm_loop/artifacts/workpad.md` (worker-owned: TODO / Notes / Data Exploration)
+1. `.llm_loop/artifacts/workpad.md` (worker-owned: Notes / Data Exploration)
 2. `.llm_loop/artifacts/mentor_notes.md` (mentor-owned; wrapper-written from mentor output)
-3. `.llm_loop/artifacts/shared_todo.md` (shared queue; mentor appends actionable items)
+3. `.llm_loop/artifacts/shared_todo.md` (single shared TODO queue; worker + mentor append actionable items)
 4. `.llm_loop/artifacts/storyline.md` (wrapper-maintained execution narrative)
 
 ## Cycle Discipline

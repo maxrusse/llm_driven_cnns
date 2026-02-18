@@ -55,10 +55,14 @@ Where timing comes from:
 - `daemon_poll_seconds` in `config/daemon_config.json` controls daemon loop sleep between cycles.
 - `monitor_seconds` is chosen per cycle decision (clamped by `default_monitor_seconds` and `max_monitor_seconds` in config).
 
+Cycle traceability:
+- Each cycle now has a `cycle_trace_id` written into events, summaries, and storyline entries for easier debugging.
+
 ## Role Contracts
 Loop mission is now role-separated:
 - Worker mission: `WORKER_MISSION.md`
 - Mentor mission: `MENTOR_MISSION.md`
+- Display names (ops/UI): `AI-Builder` (worker) and `AI-Mentor` (mentor).
 
 Cadence policy:
 - Adaptive and evidence-driven, not fixed cycle quotas.
@@ -82,10 +86,17 @@ Interaction model (SOTA-inspired):
 
 ## Worker Housekeeping (Per Cycle)
 Worker decision output includes required housekeeping fields. Wrapper writes these into artifacts:
-- `todo_new` -> `.llm_loop/artifacts/workpad.md` (`## TODO`)
+- `todo_new` -> `.llm_loop/artifacts/shared_todo.md` (single shared TODO queue)
 - `notes_update` -> `.llm_loop/artifacts/workpad.md` (`## Notes`)
 - `data_exploration_update` -> `.llm_loop/artifacts/workpad.md` (`## Data Exploration`)
 - `resolve_shared_todo_ids` -> marks matching IDs in `.llm_loop/artifacts/shared_todo.md` as resolved
+
+Context ingestion behavior:
+- Worker/mentor prompts read latest tails of `workpad.md` and `mentor_notes.md` (not file heads).
+- `shared_todo.md` is ingested as a compact recent-open summary (not full tail) to reduce context bloat.
+- `storyline.md` is treated as backup context and is included only when failure/stall signals are high.
+- Recent `.log` tails are injected only when the latest completed run failed.
+- Unresolved shared TODO count is computed from the full `shared_todo.md` file.
 
 ## Lightweight Quality Gate
 Before execution, wrapper applies a simple decision-quality checklist.
@@ -219,12 +230,14 @@ Notes:
 - Shared coordination artifacts:
   - `.llm_loop/artifacts/workpad.md` (worker-owned)
   - `.llm_loop/artifacts/mentor_notes.md` (mentor-owned, wrapper-written from mentor output)
-  - `.llm_loop/artifacts/shared_todo.md` (shared queue; mentor can append via wrapper)
+  - `.llm_loop/artifacts/shared_todo.md` (single shared queue; worker + mentor append via wrapper)
 - Config keys in `config/daemon_config.json`:
   - `mentor_enabled`
   - `mentor_every_n_cycles`
   - `mentor_force_when_stuck`
+  - `mentor_challenge_streak_min_idle_cycles` (prevents stuck-trigger mentor forcing while worker is already executing)
   - `mentor_apply_suggestions`
+  - `worker_display_name`, `mentor_display_name`
   - `mentor_require_web_search`
   - `mentor_model`, `mentor_reasoning_effort`, `mentor_web_search_mode`
 - Mentor telemetry and critique are written into each cycle event under `codex.mentor`.

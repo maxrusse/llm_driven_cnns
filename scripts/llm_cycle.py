@@ -9,7 +9,7 @@ import pathlib
 import subprocess
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -113,6 +113,18 @@ def read_text_head(path: pathlib.Path, max_chars: int = 12000) -> str:
     if len(txt) <= max_chars:
         return txt
     return txt[:max_chars]
+
+
+def read_text_tail(path: pathlib.Path, max_chars: int = 12000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+    if len(txt) <= max_chars:
+        return txt
+    return txt[-max_chars:]
 
 
 def parse_utc_iso(value: Any) -> datetime | None:
@@ -335,8 +347,6 @@ def ensure_workpad_file(loop_dir: pathlib.Path) -> pathlib.Path:
     lines = [
         "# LLM Workpad",
         "",
-        "## TODO",
-        "",
         "## Notes",
         "",
         "## Data Exploration",
@@ -346,7 +356,6 @@ def ensure_workpad_file(loop_dir: pathlib.Path) -> pathlib.Path:
 
     legacy_parts: list[str] = []
     legacy_files = [
-        ("TODO", artifacts_dir / "todo.md"),
         ("Notes", artifacts_dir / "notes.md"),
         ("Data Exploration", artifacts_dir / "data_exploration.md"),
     ]
@@ -374,10 +383,57 @@ def ensure_coordination_files(loop_dir: pathlib.Path) -> tuple[pathlib.Path, pat
 
 
 def count_unresolved_shared_todos(shared_todo_path: pathlib.Path) -> int:
-    txt = read_text_head(shared_todo_path, max_chars=60000)
-    if not txt:
+    if not shared_todo_path.exists():
         return 0
-    return sum(1 for line in txt.splitlines() if line.strip().startswith("- [ ]"))
+    try:
+        with shared_todo_path.open("r", encoding="utf-8", errors="ignore") as f:
+            return sum(1 for line in f if line.strip().startswith("- [ ]"))
+    except Exception:
+        return 0
+
+
+def summarize_recent_open_shared_todos(
+    shared_todo_path: pathlib.Path,
+    *,
+    max_items: int = 10,
+    max_chars: int = 4000,
+) -> str:
+    if not shared_todo_path.exists():
+        return ""
+    try:
+        recent_open: deque[str] = deque(maxlen=max(1, int(max_items)))
+        with shared_todo_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s.startswith("- [ ]"):
+                    continue
+                recent_open.append(" ".join(s.split())[:280])
+    except Exception:
+        return ""
+    if not recent_open:
+        return ""
+    txt = "\n".join(recent_open)
+    if len(txt) <= max_chars:
+        return txt
+    return txt[-max_chars:]
+
+
+def last_completed_run_failed(last_completed_run: Any) -> bool:
+    if not isinstance(last_completed_run, dict):
+        return False
+    status = str(last_completed_run.get("status", "")).strip().lower()
+    if status in {"killed", "stopped_by_action"}:
+        return True
+    outcome = last_completed_run.get("outcome")
+    if not isinstance(outcome, dict):
+        return False
+    out_status = str(outcome.get("status", "")).strip().lower()
+    exit_code = outcome.get("exit_code")
+    if out_status == "killed":
+        return True
+    if out_status == "completed" and isinstance(exit_code, int):
+        return exit_code != 0
+    return False
 
 
 def append_entries_to_section(md_path: pathlib.Path, section_title: str, entries: list[str]) -> int:
@@ -432,13 +488,39 @@ def resolve_shared_todo_ids(shared_todo_path: pathlib.Path, resolve_ids: list[st
         if not matched_id:
             continue
         new_line = line.replace("- [ ]", "- [x]", 1)
-        if "resolved by worker" not in new_line:
-            new_line = new_line + f" (resolved by worker C{cycle_index:04d})"
+        if "resolved by ai-builder" not in new_line.lower():
+            new_line = new_line + f" (resolved by AI-Builder C{cycle_index:04d})"
         lines[i] = new_line
         resolved += 1
     if resolved:
         shared_todo_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return resolved
+
+
+def append_shared_todo_entries(
+    shared_todo_path: pathlib.Path,
+    *,
+    cycle_index: int,
+    owner_token: str,
+    role_label: str,
+    items: list[str],
+    max_items: int,
+) -> int:
+    if not items:
+        return 0
+    token = "".join(ch for ch in str(owner_token).upper() if ch.isalnum())[:1] or "W"
+    added = 0
+    with shared_todo_path.open("a", encoding="utf-8") as f:
+        for idx, item in enumerate(items[:max_items], start=1):
+            clean = " ".join(str(item).strip().split())
+            if not clean:
+                continue
+            todo_id = f"C{cycle_index:04d}-{token}{idx:02d}"
+            f.write(f"- [ ] [{todo_id}] {role_label}: {clean[:220]}\n")
+            added += 1
+        if added:
+            f.write("\n")
+    return added
 
 
 def append_worker_housekeeping_artifacts(
@@ -447,6 +529,7 @@ def append_worker_housekeeping_artifacts(
     shared_todo_path: pathlib.Path,
     cycle_index: int,
     housekeeping: dict[str, Any],
+    worker_display_name: str,
 ) -> dict[str, Any]:
     hk = housekeeping if isinstance(housekeeping, dict) else {}
     now_utc = utc_now()
@@ -460,18 +543,22 @@ def append_worker_housekeeping_artifacts(
     if not isinstance(resolve_ids, list):
         resolve_ids = []
 
-    todo_entries = []
-    todo_seq = 1
+    todo_items = []
     for item in todo_new[:4]:
         clean = " ".join(str(item).strip().split())
-        if not clean:
-            continue
-        todo_entries.append(f"- [ ] [C{cycle_index:04d}-W{todo_seq:02d}] {clean[:220]} ({now_utc})")
-        todo_seq += 1
+        if clean:
+            todo_items.append(clean[:220])
     notes_entries = [f"- [{now_utc}] {notes_update[:500]}"] if notes_update else []
     data_entries = [f"- [{now_utc}] {data_update[:500]}"] if data_update else []
 
-    todo_added = append_entries_to_section(workpad_path, "TODO", todo_entries)
+    todo_added = append_shared_todo_entries(
+        shared_todo_path,
+        cycle_index=cycle_index,
+        owner_token="W",
+        role_label=worker_display_name,
+        items=todo_items,
+        max_items=4,
+    )
     notes_added = append_entries_to_section(workpad_path, "Notes", notes_entries)
     data_added = append_entries_to_section(workpad_path, "Data Exploration", data_entries)
     resolved_shared = resolve_shared_todo_ids(shared_todo_path, [str(x) for x in resolve_ids[:6]], cycle_index)
@@ -491,6 +578,7 @@ def append_mentor_coordination_artifacts(
     mentor_notes_path: pathlib.Path,
     shared_todo_path: pathlib.Path,
     cycle_index: int,
+    mentor_display_name: str,
     mentor_recommendation: str,
     mentor_critique: str,
     mentor_questions: list[str],
@@ -512,18 +600,14 @@ def append_mentor_coordination_artifacts(
     with mentor_notes_path.open("a", encoding="utf-8") as f:
         f.write("\n".join(note_lines))
 
-    added = 0
-    if todo_updates:
-        with shared_todo_path.open("a", encoding="utf-8") as f:
-            for idx, item in enumerate(todo_updates[:6], start=1):
-                clean = str(item).strip()
-                if not clean:
-                    continue
-                todo_id = f"C{cycle_index:04d}-M{idx:02d}"
-                f.write(f"- [ ] [{todo_id}] mentor: {clean}\n")
-                added += 1
-            if added:
-                f.write("\n")
+    added = append_shared_todo_entries(
+        shared_todo_path,
+        cycle_index=cycle_index,
+        owner_token="M",
+        role_label=mentor_display_name,
+        items=[str(x).strip() for x in todo_updates],
+        max_items=6,
+    )
     unresolved = count_unresolved_shared_todos(shared_todo_path)
     return added, unresolved
 
@@ -854,14 +938,15 @@ def build_prompt(
         "Use mission/contract text as agenda and execute it step-by-step.",
         "At the start of every cycle, re-check runtime status: active_run, last_completed_run, and recent events before deciding.",
         "Re-check mission goals each cycle against mission_text; if goals and action diverge, correct course now.",
-        "Re-read .llm_loop/artifacts/storyline.md and .llm_loop/artifacts/workpad.md when uncertain or stuck, then decide using already-completed work as evidence.",
+        "Treat .llm_loop/artifacts/storyline.md as backup context; consult it when uncertain/stuck, not as a mandatory every-cycle read.",
         "Use mentor_context when present: if recent mentor feedback challenged your direction, address it explicitly before repeating similar commands.",
         "If mentor_context.search_requirement_unmet is true, run a web-search-supported cycle before another training-heavy command.",
         "Role separation: worker owns analysis/exploration/training execution; mentor owns critique only.",
         "Check .llm_loop/artifacts/shared_todo.md each cycle; prioritize unresolved mentor items when they are high-impact and evidence-seeking.",
         "Use .llm_loop/artifacts/workpad.md as worker-owned notes; do not repurpose mentor notes as execution logs.",
         "Maintain one structured workspace file at .llm_loop/artifacts/workpad.md.",
-        "Inside workpad.md, keep sections for TODO, Notes, and Data Exploration updated with concise UTC-stamped entries.",
+        "Inside workpad.md, keep Notes and Data Exploration updated with concise UTC-stamped entries.",
+        "Use housekeeping.todo_new to append actionable items into the single shared queue at .llm_loop/artifacts/shared_todo.md.",
         "Every cycle, provide housekeeping updates in the required `housekeeping` object, even if some fields are empty.",
         "Resolve shared mentor TODOs when done by listing IDs in housekeeping.resolve_shared_todo_ids.",
         "If there is no active run and mission goals are clear, prefer run_command over wait.",
@@ -918,6 +1003,8 @@ def build_prompt(
         "mission": "Keep control of CNN experiments. Decide what to run, when to stop, and when to wait.",
         "dataset_domain": "X-ray fracture segmentation (medical imaging).",
         "run_id": run_id,
+        "cycle_trace_id": str(context.get("cycle_trace_id", "")),
+        "display_name": str(context.get("worker_display_name", "AI-Builder")),
         "rules": rules,
         "mission_contract": {
             "worker_mission_file": context.get("mission_file"),
@@ -934,7 +1021,7 @@ def build_prompt(
             "workpad": ".llm_loop/artifacts/workpad.md",
             "shared_todo": ".llm_loop/artifacts/shared_todo.md",
             "housekeeping_output": {
-                "todo_new": "0-4 concise TODO bullets to append under workpad TODO",
+                "todo_new": "0-4 concise TODO bullets to append to shared_todo.md (single queue)",
                 "notes_update": "one concise note for workpad Notes (or empty string)",
                 "data_exploration_update": "one concise observation/hypothesis for Data Exploration (or empty string)",
                 "resolve_shared_todo_ids": "0-6 shared TODO IDs to mark resolved (e.g. C0002-M01)",
@@ -968,6 +1055,8 @@ def build_mentor_prompt(
     finishup_context = context.get("finishup_context")
     finishup_active = isinstance(finishup_context, dict) and bool(finishup_context.get("active", False))
     review_context = {
+        "cycle_trace_id": str(context.get("cycle_trace_id", "")),
+        "mentor_display_name": str(context.get("mentor_display_name", "AI-Mentor")),
         "time_utc": context.get("time_utc"),
         "active_run": context.get("active_run"),
         "last_completed_run": context.get("last_completed_run"),
@@ -1018,6 +1107,7 @@ def build_mentor_prompt(
     prompt = {
         "role": "Critical mentor for autonomous CNN experimentation loop",
         "run_id": run_id,
+        "display_name": str(context.get("mentor_display_name", "AI-Mentor")),
         "rules": rules,
         "mission_contract": {
             "mentor_mission_file": review_context.get("mentor_mission_file"),
@@ -1043,39 +1133,45 @@ def should_run_mentor(
     cycle_index: int,
     mentor_every_n_cycles: int,
     mentor_force_when_stuck: bool,
+    mentor_challenge_streak_min_idle_cycles: int,
     context: dict[str, Any],
 ) -> tuple[bool, list[str]]:
     if not mentor_enabled:
         return False, ["mentor_disabled"]
     reasons: list[str] = []
     n = max(1, int(mentor_every_n_cycles))
+    min_idle_cycles = max(0, int(mentor_challenge_streak_min_idle_cycles))
     if cycle_index % n == 0:
         reasons.append(f"cadence_every_{n}")
     if mentor_force_when_stuck:
         exploration_cadence = context.get("exploration_cadence_context")
+        cycles_since_last_run_command = 0
         if isinstance(exploration_cadence, dict):
             research_priority = safe_float(exploration_cadence.get("research_priority"))
             non_training_priority = safe_float(exploration_cadence.get("non_training_priority"))
-            todo_pressure = safe_float(exploration_cadence.get("todo_pressure"))
-            if research_priority is not None and research_priority >= 0.75:
-                reasons.append("research_priority_high")
-            elif bool(exploration_cadence.get("research_pass_due", False)):
-                reasons.append("research_pass_due")
-            if non_training_priority is not None and non_training_priority >= 0.75:
-                reasons.append("non_training_priority_high")
-            elif bool(exploration_cadence.get("non_training_cycle_due", False)):
-                reasons.append("non_training_cycle_due")
-            if todo_pressure is not None and todo_pressure >= 0.70:
-                reasons.append("todo_pressure_high")
+            cycles_since_raw = safe_float(exploration_cadence.get("cycles_since_last_run_command"))
+            if cycles_since_raw is not None:
+                cycles_since_last_run_command = max(0, int(cycles_since_raw))
+            if research_priority is not None and research_priority >= 0.90:
+                reasons.append("research_priority_critical")
+            if non_training_priority is not None and non_training_priority >= 0.90:
+                reasons.append("non_training_priority_critical")
         breakout_context = context.get("breakout_context")
         if isinstance(breakout_context, dict):
             breakout_priority = safe_float(breakout_context.get("breakout_priority"))
-            if breakout_priority is not None and breakout_priority >= 0.75:
-                reasons.append("breakout_priority_high")
-            elif bool(breakout_context.get("breakout_needed", False)):
-                reasons.append("breakout_needed")
+            if breakout_priority is not None and breakout_priority >= 0.90:
+                reasons.append("breakout_priority_critical")
+        exploration_context = context.get("exploration_context")
+        if isinstance(exploration_context, dict):
+                non_improving = safe_float(exploration_context.get("non_improving_streak"))
+                if non_improving is not None and non_improving >= 5:
+                    reasons.append("non_improving_streak_high")
         mentor_context = context.get("mentor_context")
-        if isinstance(mentor_context, dict) and int(mentor_context.get("challenge_streak", 0) or 0) >= 2:
+        if (
+            isinstance(mentor_context, dict)
+            and int(mentor_context.get("challenge_streak", 0) or 0) >= 2
+            and cycles_since_last_run_command >= min_idle_cycles
+        ):
             reasons.append("mentor_challenge_streak")
     return bool(reasons), (reasons if reasons else ["not_due"])
 
@@ -1284,15 +1380,23 @@ def collect_context(
         finishup_default_report_top_k=finishup_default_report_top_k,
     )
     unresolved_shared_todo_count = count_unresolved_shared_todos(shared_todo_path)
-    latest_logs = []
-    for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:6]:
-        latest_logs.append(
-            {
-                "name": p.name,
-                "size_bytes": p.stat().st_size,
-                "tail": tail_text(p, max_bytes=10000)[-4000:],
-            }
-        )
+    shared_todo_focus = summarize_recent_open_shared_todos(
+        shared_todo_path,
+        max_items=10,
+        max_chars=4000,
+    )
+    last_completed = state.get("last_completed_run")
+    last_run_failed = last_completed_run_failed(last_completed)
+    latest_logs: list[dict[str, Any]] = []
+    if last_run_failed:
+        for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:4]:
+            latest_logs.append(
+                {
+                    "name": p.name,
+                    "size_bytes": p.stat().st_size,
+                    "tail": tail_text(p, max_bytes=10000)[-3000:],
+                }
+            )
 
     active = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
     active_live = False
@@ -1437,6 +1541,15 @@ def collect_context(
         cycles_since_last_web_search += 1
     if not seen_web:
         cycles_since_last_web_search = len(recent_web_flags)
+    cycles_since_last_run_command = 0
+    seen_run_command = False
+    for e in reversed(recent_events):
+        if str(e.get("action", "")).strip().lower() == "run_command":
+            seen_run_command = True
+            break
+        cycles_since_last_run_command += 1
+    if not seen_run_command:
+        cycles_since_last_run_command = len(recent_events)
     unresolved_todo_pressure = clamp01(float(unresolved_shared_todo_count) / 8.0)
     research_priority = clamp01(
         0.14 * float(consecutive_training_runs)
@@ -1468,6 +1581,12 @@ def collect_context(
         + 0.05 * float(mentor_challenge_streak)
     )
     breakout_needed = bool(breakout_priority >= 0.70)
+    include_storyline_tail = bool(
+        last_run_failed
+        or mentor_search_requirement_unmet
+        or non_improving_streak >= 4
+        or repeated_category_streak >= 4
+    )
 
     return {
         "time_utc": utc_now(),
@@ -1475,21 +1594,22 @@ def collect_context(
         "data_source_root": data_source_root,
         "active_run": active,
         "active_run_live": active_live,
-        "last_completed_run": state.get("last_completed_run"),
+        "last_completed_run": last_completed,
         "recent_events_tail": tail_text(events_path, max_bytes=14000)[-5000:],
         "recent_logs": latest_logs,
+        "failure_context_active": last_run_failed,
         "mission_file": str(worker_mission_path),
         "mission_text": read_text_head(worker_mission_path, max_chars=12000),
         "mentor_mission_file": str(mentor_mission_path),
         "mentor_mission_text": read_text_head(mentor_mission_path, max_chars=12000),
         "workpad_file": str(workpad_path),
-        "workpad_text": read_text_head(workpad_path, max_chars=20000),
+        "workpad_text": read_text_tail(workpad_path, max_chars=20000),
         "mentor_notes_file": str(mentor_notes_path),
-        "mentor_notes_tail": read_text_head(mentor_notes_path, max_chars=12000),
+        "mentor_notes_tail": read_text_tail(mentor_notes_path, max_chars=12000),
         "shared_todo_file": str(shared_todo_path),
-        "shared_todo_tail": read_text_head(shared_todo_path, max_chars=12000),
+        "shared_todo_tail": shared_todo_focus,
         "storyline_file": str(storyline_path),
-        "storyline_tail": read_text_head(storyline_path, max_chars=9000),
+        "storyline_tail": (read_text_tail(storyline_path, max_chars=9000) if include_storyline_tail else ""),
         "architecture_probe": {
             "optional": True,
             "marker_file": str(model_selection_marker),
@@ -1551,6 +1671,7 @@ def collect_context(
             "recent_training_runs_8": int(sum(1 for x in recent_training_window if x)),
             "consecutive_training_runs": consecutive_training_runs,
             "cycles_since_last_web_search": cycles_since_last_web_search,
+            "cycles_since_last_run_command": cycles_since_last_run_command,
             "research_pass_due": research_pass_due,
             "non_training_cycle_due": non_training_cycle_due,
             "research_priority": research_priority,
@@ -2430,6 +2551,7 @@ def write_cycle_summary(
         {
             "ts_utc": now_utc,
             "cycle": cycle_index,
+            "cycle_trace_id": str(cycle_result.get("cycle_trace_id", "")),
             "action": cycle_result.get("action"),
             "result": cycle_result.get("result"),
             "run_label": run_label,
@@ -2498,10 +2620,12 @@ def write_storyline(
             outcome_txt += f" (exit={run_outcome.get('exit_code')})"
     delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
     next_txt = "continue rechallenge loop" if str(cycle_result.get("result", "")) == "run_command" else "await next signal"
-    mentor_txt = "mentor=skipped"
+    mentor_label = str((mentor_info or {}).get("display_name", "")).strip() or "AI-Mentor"
+    worker_label = str((worker_hk_info or {}).get("display_name", "")).strip() or "AI-Builder"
+    mentor_txt = f"{mentor_label}=skipped"
     if mentor_info:
         mentor_txt = (
-            "mentor="
+            f"{mentor_label}="
             + ("run" if bool(mentor_info.get("run", False)) else "not_due")
             + ", rec="
             + (str(mentor_info.get("recommendation", "")).strip() or "n/a")
@@ -2545,14 +2669,14 @@ def write_storyline(
 
     lines = [
         f"## Cycle {cycle_index:04d} | {now_utc}",
-        f"1. Situation: active_run={str(state.get('active_run') is not None).lower()}, last_result={cycle_result.get('result', 'n/a')}",
+        f"1. Situation: trace_id={str(cycle_result.get('cycle_trace_id', '') or 'n/a')}, active_run={str(state.get('active_run') is not None).lower()}, last_result={cycle_result.get('result', 'n/a')}",
         f"2. Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, run_label={run_label}, why={rationale or 'n/a'}",
         f"3. Quality gate: {quality_gate_txt}",
         f"4. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
         f"5. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
         f"6. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
-        f"7. Mentor: {mentor_txt}",
-        f"8. Worker housekeeping: {worker_hk_txt}",
+        f"7. {mentor_label}: {mentor_txt}",
+        f"8. {worker_label} housekeeping: {worker_hk_txt}",
         f"9. Next checkpoint: {next_txt}",
         "",
     ]
@@ -2625,8 +2749,15 @@ def main() -> None:
     mentor_web_search_mode = str(cfg.get("mentor_web_search_mode", web_search_mode)).strip() or web_search_mode
     mentor_network_access_enabled = bool(cfg.get("mentor_network_access_enabled", network_access_enabled))
     mentor_force_when_stuck = bool(cfg.get("mentor_force_when_stuck", True))
+    try:
+        mentor_challenge_streak_min_idle_cycles = int(cfg.get("mentor_challenge_streak_min_idle_cycles", 2))
+    except Exception:
+        mentor_challenge_streak_min_idle_cycles = 2
+    mentor_challenge_streak_min_idle_cycles = max(0, mentor_challenge_streak_min_idle_cycles)
     mentor_apply_suggestions = bool(cfg.get("mentor_apply_suggestions", True))
     mentor_require_web_search = bool(cfg.get("mentor_require_web_search", True))
+    worker_display_name = str(cfg.get("worker_display_name", "AI-Builder")).strip() or "AI-Builder"
+    mentor_display_name = str(cfg.get("mentor_display_name", "AI-Mentor")).strip() or "AI-Mentor"
     auto_repair_enabled = bool(cfg.get("auto_repair_enabled", True))
     auto_repair_retry_on_success = bool(cfg.get("auto_repair_retry_on_success", True))
     auto_repair_allow_direct_module_install = bool(cfg.get("auto_repair_allow_direct_module_install", True))
@@ -2704,13 +2835,18 @@ def main() -> None:
         finishup_default_report_top_k=finishup_default_report_top_k,
     )
     cycle_index = count_jsonl_rows(events_file) + 1
+    cycle_trace_id = f"C{cycle_index:04d}-{uuid.uuid4().hex[:8]}"
     mentor_due, mentor_reasons = should_run_mentor(
         mentor_enabled=mentor_enabled,
         cycle_index=cycle_index,
         mentor_every_n_cycles=mentor_every_n_cycles,
         mentor_force_when_stuck=mentor_force_when_stuck,
+        mentor_challenge_streak_min_idle_cycles=mentor_challenge_streak_min_idle_cycles,
         context=context,
     )
+    context["cycle_trace_id"] = cycle_trace_id
+    context["worker_display_name"] = worker_display_name
+    context["mentor_display_name"] = mentor_display_name
     context["bootstrap_command"] = bootstrap_command
     context["bootstrap_label"] = bootstrap_label
     context["force_bootstrap_if_idle"] = force_bootstrap_if_idle
@@ -2832,6 +2968,7 @@ def main() -> None:
             mentor_notes_path=mentor_notes_path,
             shared_todo_path=shared_todo_path,
             cycle_index=cycle_index,
+            mentor_display_name=mentor_display_name,
             mentor_recommendation=mentor_recommendation or "n/a",
             mentor_critique=mentor_critique,
             mentor_questions=mentor_questions,
@@ -2857,12 +2994,14 @@ def main() -> None:
         shared_todo_path=shared_todo_path,
         cycle_index=cycle_index,
         housekeeping=worker_housekeeping,
+        worker_display_name=worker_display_name,
     )
     unresolved_shared_todo_count = int(worker_housekeeping_result.get("shared_todo_unresolved", unresolved_shared_todo_count))
 
     previous_last_completed = state.get("last_completed_run")
     cycle_result: dict[str, Any] = {
         "ts_utc": utc_now(),
+        "cycle_trace_id": cycle_trace_id,
         "action": action,
         "idea_category": idea_category,
         "rationale": rationale,
@@ -2879,6 +3018,7 @@ def main() -> None:
             "trace_file": str(codex_telemetry.get("trace_file", "")) if isinstance(codex_telemetry, dict) else "",
             "tool_signals": codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else [],
             "mentor": {
+                "display_name": mentor_display_name,
                 "enabled": mentor_enabled,
                 "run": mentor_due,
                 "reasons": mentor_reasons,
@@ -2899,6 +3039,7 @@ def main() -> None:
                 "error": mentor_error,
             },
             "worker_housekeeping": {
+                "display_name": worker_display_name,
                 "todo_added": int(worker_housekeeping_result.get("todo_added", 0)),
                 "notes_added": int(worker_housekeeping_result.get("notes_added", 0)),
                 "data_exploration_added": int(worker_housekeeping_result.get("data_exploration_added", 0)),

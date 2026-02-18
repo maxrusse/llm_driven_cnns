@@ -30,7 +30,7 @@
 
 ## Housekeeping Contract (Required Every Cycle)
 - Update worker artifacts via housekeeping fields:
-  - `todo_new`: 0-4 concrete next-step tasks.
+  - `todo_new`: 0-4 concrete next-step tasks (append to `.llm_loop/artifacts/shared_todo.md`).
   - `notes_update`: concise interpretation of cycle context/decision.
   - `data_exploration_update`: one concrete data observation or hypothesis.
   - `resolve_shared_todo_ids`: IDs to mark complete when done.
