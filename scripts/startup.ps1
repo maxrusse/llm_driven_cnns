@@ -1,6 +1,11 @@
 param(
     [string]$ConfigPath = "config/daemon_config.json",
-    [switch]$StartInNewWindow
+    [switch]$StartInNewWindow,
+    [double]$RunHours = 0,
+    [int]$FinishupMinutes = 60,
+    [int]$FinishupFinalTrainingRounds = 1,
+    [int]$FinishupTopK = 10,
+    [string]$FinishupNote = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +18,21 @@ $workspaceRoot = if ([string]::IsNullOrWhiteSpace([string]$cfg.workspace_root)) 
 $dataSourceRoot = [string]$cfg.data_source_root
 
 & (Join-Path $repoRoot "scripts\\link_data.ps1") -WorkspaceRoot $workspaceRoot -DataSourceRoot $dataSourceRoot
+
+$requestFinishupScript = Join-Path $repoRoot "scripts\\request_finishup.ps1"
+if ($RunHours -gt 0) {
+    if (-not (Test-Path $requestFinishupScript)) {
+        throw "Missing finish-up request script: $requestFinishupScript"
+    }
+    & $requestFinishupScript `
+        -WorkspaceRoot $workspaceRoot `
+        -RunHours $RunHours `
+        -MinutesLeft $FinishupMinutes `
+        -FinalTrainingRounds $FinishupFinalTrainingRounds `
+        -TopK $FinishupTopK `
+        -Note $FinishupNote
+    Write-Host ("Scheduled finish-up via startup: RunHours=" + $RunHours + ", FinishupMinutes=" + $FinishupMinutes)
+}
 
 $daemonScript = Join-Path $repoRoot "scripts\\start_llm_daemon.ps1"
 if ($StartInNewWindow) {

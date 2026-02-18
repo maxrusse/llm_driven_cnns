@@ -10,7 +10,7 @@ import subprocess
 import time
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 FORBIDDEN_EXECUTION_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -51,6 +51,8 @@ DEFAULT_AUTO_REPAIR_MODEL_FALLBACK_MAP: dict[str, str] = {
     "unet_resnet34_dual": "simple_unet_dual_head",
     "unet_resnet34_dual_head": "simple_unet_dual_head",
 }
+DEFAULT_FINISHUP_CONTROL_FILE = ".llm_loop/FINISH_UP.json"
+DEFAULT_FINISHUP_REPORT_SCRIPT = "scripts/generate_finishup_report.py"
 
 
 def utc_now() -> str:
@@ -111,6 +113,216 @@ def read_text_head(path: pathlib.Path, max_chars: int = 12000) -> str:
     if len(txt) <= max_chars:
         return txt
     return txt[:max_chars]
+
+
+def parse_utc_iso(value: Any) -> datetime | None:
+    txt = str(value or "").strip()
+    if not txt:
+        return None
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def resolve_config_path(base_dir: pathlib.Path, raw_path: str, default_rel: str) -> pathlib.Path:
+    candidate = str(raw_path or "").strip() or default_rel
+    p = pathlib.Path(candidate)
+    if not p.is_absolute():
+        p = base_dir / p
+    return p.resolve()
+
+
+def is_training_like(run_label: str, command_preview: str) -> bool:
+    if is_training_command_text(run_label) or is_training_command_text(command_preview):
+        return True
+    txt = f"{run_label} {command_preview}".lower()
+    if "arch_" in txt or "loss_" in txt or "finetune" in txt:
+        return True
+    return False
+
+
+def collect_finishup_context(
+    *,
+    workspace_root: pathlib.Path,
+    state: dict[str, Any],
+    events_path: pathlib.Path,
+    finishup_control_path: pathlib.Path,
+    finishup_report_script: pathlib.Path,
+    finishup_default_minutes_left: int,
+    finishup_default_report_top_k: int,
+) -> dict[str, Any]:
+    default_minutes = max(5, int(finishup_default_minutes_left))
+    default_top_k = max(3, min(20, int(finishup_default_report_top_k)))
+    out: dict[str, Any] = {
+        "active": False,
+        "control_file": str(finishup_control_path),
+        "requested_utc": "",
+        "activate_at_utc": "",
+        "deadline_utc": "",
+        "minutes_left": None,
+        "minutes_until_activation": None,
+        "total_minutes_window": default_minutes,
+        "requested_note": "",
+        "status": "inactive",
+        "final_training_rounds_target": 1,
+        "final_training_rounds_completed": 0,
+        "remaining_final_training_rounds": 1,
+        "force_report_now": False,
+        "report_top_k": default_top_k,
+        "report_script": str(finishup_report_script),
+        "report_script_exists": finishup_report_script.exists(),
+        "report_outputs": {
+            "condensed_story_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_condensed_story.md"),
+            "paper_report_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_paper_report.md"),
+            "leaderboard_json": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{default_top_k}.json"),
+            "leaderboard_md": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{default_top_k}.md"),
+        },
+    }
+    if not finishup_control_path.exists():
+        return out
+
+    payload = read_json(finishup_control_path, {})
+    if not isinstance(payload, dict):
+        return out
+
+    enabled = bool(payload.get("enabled", True))
+    status_txt = str(payload.get("status", "requested")).strip().lower() or "requested"
+    if not enabled or status_txt in {"cancelled", "done", "closed"}:
+        out["status"] = status_txt
+        return out
+
+    now = datetime.now(timezone.utc)
+    requested_dt = parse_utc_iso(payload.get("requested_utc")) or now
+    activate_at_dt = parse_utc_iso(payload.get("activate_at_utc"))
+    if activate_at_dt is None:
+        activate_at_dt = requested_dt
+    minutes_window = safe_float(payload.get("minutes_left"))
+    if minutes_window is None:
+        minutes_window = safe_float(payload.get("total_minutes_window"))
+    if minutes_window is None:
+        minutes_window = float(default_minutes)
+    minutes_window = max(5.0, float(minutes_window))
+    deadline_dt = parse_utc_iso(payload.get("deadline_utc"))
+    if deadline_dt is None:
+        deadline_dt = activate_at_dt + timedelta(minutes=minutes_window)
+    minutes_left = (deadline_dt - now).total_seconds() / 60.0
+    minutes_until_activation = (activate_at_dt - now).total_seconds() / 60.0
+
+    rounds_target = payload.get("final_training_rounds_target", payload.get("last_training_rounds_target", 1))
+    try:
+        final_training_rounds_target = max(0, int(rounds_target))
+    except Exception:
+        final_training_rounds_target = 1
+    force_report_now = bool(payload.get("force_report_now", False))
+    if bool(payload.get("immediate_report", False)):
+        force_report_now = True
+    top_k_raw = payload.get("report_top_k", default_top_k)
+    try:
+        top_k = max(3, min(20, int(top_k_raw)))
+    except Exception:
+        top_k = default_top_k
+
+    requested_iso = requested_dt.isoformat()
+    activate_iso = activate_at_dt.isoformat()
+    active_now = minutes_until_activation <= 0.0
+    counting_start_dt = activate_at_dt if activate_at_dt is not None else requested_dt
+
+    if not active_now:
+        out.update(
+            {
+                "active": False,
+                "status": "scheduled",
+                "requested_utc": requested_iso,
+                "activate_at_utc": activate_iso,
+                "deadline_utc": deadline_dt.isoformat(),
+                "minutes_left": round(minutes_left, 2),
+                "minutes_until_activation": round(minutes_until_activation, 2),
+                "total_minutes_window": round(minutes_window, 2),
+                "requested_note": str(payload.get("note", "")).strip(),
+                "final_training_rounds_target": final_training_rounds_target,
+                "final_training_rounds_completed": 0,
+                "remaining_final_training_rounds": final_training_rounds_target,
+                "force_report_now": force_report_now,
+                "phase": "scheduled",
+                "report_top_k": top_k,
+                "report_script": str(finishup_report_script),
+                "report_script_exists": finishup_report_script.exists(),
+                "mentor_brief": "Finish-up is scheduled but not active yet.",
+                "report_outputs": {
+                    "condensed_story_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_condensed_story.md"),
+                    "paper_report_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_paper_report.md"),
+                    "leaderboard_json": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.json"),
+                    "leaderboard_md": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.md"),
+                },
+            }
+        )
+        return out
+
+    completed = 0
+    for evt in read_recent_jsonl(events_path, max_lines=6000):
+        ts = parse_utc_iso(evt.get("ts_utc"))
+        if ts is None or ts < counting_start_dt:
+            continue
+        if str(evt.get("action", "")).strip().lower() != "run_command":
+            continue
+        run_outcome = evt.get("run_outcome")
+        if not isinstance(run_outcome, dict):
+            continue
+        status = str(run_outcome.get("status", "")).strip().lower()
+        if status not in {"completed", "monitor_window_elapsed"}:
+            continue
+        if is_training_like(str(evt.get("run_label", "")), str(evt.get("command_preview", ""))):
+            completed += 1
+
+    remaining = max(0, final_training_rounds_target - completed)
+    phase = "final_training"
+    if force_report_now:
+        phase = "reporting"
+    elif remaining <= 0:
+        phase = "reporting"
+    elif minutes_left <= 20.0:
+        phase = "reporting"
+
+    active_run = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
+    has_active = bool(active_run and isinstance(active_run.get("pid"), int) and is_pid_running(int(active_run["pid"])))
+    out.update(
+        {
+            "active": True,
+            "status": ("active" if status_txt == "scheduled" else status_txt),
+            "requested_utc": requested_iso,
+            "activate_at_utc": activate_iso,
+            "deadline_utc": deadline_dt.isoformat(),
+            "minutes_left": round(minutes_left, 2),
+            "minutes_until_activation": round(minutes_until_activation, 2),
+            "total_minutes_window": round(minutes_window, 2),
+            "requested_note": str(payload.get("note", "")).strip(),
+            "final_training_rounds_target": final_training_rounds_target,
+            "final_training_rounds_completed": completed,
+            "remaining_final_training_rounds": remaining,
+            "force_report_now": force_report_now,
+            "phase": phase,
+            "report_top_k": top_k,
+            "report_script": str(finishup_report_script),
+            "report_script_exists": finishup_report_script.exists(),
+            "active_run_present": has_active,
+            "mentor_brief": (
+                "User requested finish-up stage. Respect deadline, run final high-value training when feasible, then produce final reports."
+            ),
+            "report_outputs": {
+                "condensed_story_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_condensed_story.md"),
+                "paper_report_md": str(workspace_root / ".llm_loop" / "artifacts" / "final_paper_report.md"),
+                "leaderboard_json": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.json"),
+                "leaderboard_md": str(workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.md"),
+            },
+        }
+    )
+    return out
 
 
 def ensure_workpad_file(loop_dir: pathlib.Path) -> pathlib.Path:
@@ -630,6 +842,8 @@ def build_prompt(
     max_monitor_seconds: int,
     rechallenge_on_done: bool,
 ) -> str:
+    finishup_context = context.get("finishup_context")
+    finishup_active = isinstance(finishup_context, dict) and bool(finishup_context.get("active", False))
     rules = [
         "LLM is in the driver seat. No automatic picking outside your decision.",
         "Do not tune on test split.",
@@ -669,16 +883,31 @@ def build_prompt(
         "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
         "In data exploration, include split/leakage checks, label quality checks, resolution/view heterogeneity, and positive-case strata analysis.",
         "Translate data findings into concrete hypotheses and experiments; do not stay in threshold/LR tuning only.",
+        "When exploration_context.data_centric_gap is true, prioritize a data-aware move (preprocessing/augmentation/data_sampling) in the next actionable cycle.",
+        "Evidence-backed bundling is allowed: combine 2-4 previously helpful factors when they are compatible and testable.",
+        "Avoid blind full-switch behavior; reuse proven helpful elements unless they conflict with new evidence.",
+        "When changing architecture/loss, preserve proven data-aware settings when possible instead of resetting everything.",
         "Architecture probes are optional (1-2 quick probes when uncertainty is high), not mandatory before data-centric work.",
         "Shift early into data-centric exploration: include preprocessing and augmentation or data_sampling ideas before many optimizer micro-tweaks.",
         "Fast-dev settings are for scouting only; promote promising recipes to stronger budgets quickly (more epochs/batches and broader eval) when signal is flat.",
         "When breakout_priority is high, prioritize structural experiments over micro-tuning: supported backbones/models, head/decoder changes, and training-budget increases.",
+        "Do not attempt full from-scratch model builds in this loop unless the user explicitly asks for it.",
         "Avoid local tuning traps by pivoting away from repeated threshold/LR-only tweaks when evidence quality is weak.",
         "When unresolved_shared_todo_count is high, address high-impact open TODOs promptly and explain deferrals explicitly in housekeeping notes.",
         "Keep tone practical and concise in rationale; avoid over-planning.",
         "Hard constraint: do not execute nnU-Net/nnUNet/nnUNetv2 pipelines here (reserved for separate manual comparison).",
         "When using internet research, extract generic strategy patterns and evidence quality signals; do not copy a turnkey pipeline verbatim.",
     ]
+    if finishup_active:
+        rules.extend(
+            [
+                "Finish-up mode is active: user requested wrap-up by deadline with mentor awareness.",
+                "If remaining_final_training_rounds > 0 and no active run, prioritize one high-confidence final training or fine-tuning run that can finish before deadline.",
+                "Do not start broad exploration loops in finish-up mode; keep decisions deadline-aware and execution-focused.",
+                "When remaining_final_training_rounds == 0 or minutes_left is low, prioritize report generation.",
+                "Use finishup_context.report_script and finishup_context.report_outputs to produce final condensed story, paper-style report, and top-k leaderboard artifacts.",
+            ]
+        )
     if rechallenge_on_done:
         rules.append(
             "If a prior run completed and no run is active, prefer a rechallenge run_command that changes one meaningful factor."
@@ -736,6 +965,8 @@ def build_mentor_prompt(
     primary_decision: dict[str, Any],
     require_web_search: bool,
 ) -> str:
+    finishup_context = context.get("finishup_context")
+    finishup_active = isinstance(finishup_context, dict) and bool(finishup_context.get("active", False))
     review_context = {
         "time_utc": context.get("time_utc"),
         "active_run": context.get("active_run"),
@@ -753,6 +984,7 @@ def build_mentor_prompt(
         "shared_todo_tail": context.get("shared_todo_tail", ""),
         "storyline_tail": context.get("storyline_tail", ""),
         "recent_events_tail": context.get("recent_events_tail", ""),
+        "finishup_context": finishup_context if isinstance(finishup_context, dict) else {},
     }
     rules = [
         "Act as a critical but practical mentor reviewing the primary decision.",
@@ -764,8 +996,22 @@ def build_mentor_prompt(
         "If the decision is sound, return recommendation=continue and suggested_decision=null.",
         "If the decision is weak, return recommendation=challenge and provide a full suggested_decision.",
         "When uncertainty remains after repeated non-improving cycles, propose at least one concrete model_arch alternative with expected tradeoff.",
+        "Challenge blind full-switch behavior when there is reusable positive evidence from prior runs.",
+        "Encourage bundling 2-4 compatible proven factors when this increases expected signal quality.",
+        "If exploration_context.data_centric_gap is true, challenge plans that skip data-aware actions (preprocessing/augmentation/data_sampling).",
+        "Require that structural pivots preserve proven helpful data-aware settings unless a conflict is justified.",
+        "Reject large from-scratch model-build plans unless explicitly requested by user.",
         "Do not propose forbidden approaches: nnU-Net / nnUNet / nnUNetv2.",
     ]
+    if finishup_active:
+        rules.extend(
+            [
+                "Finish-up mode is active: critique must be deadline-aware and action-oriented.",
+                "Challenge any plan that wastes remaining time on broad exploration loops.",
+                "Ensure one last high-value training/fine-tune attempt is chosen when remaining_final_training_rounds > 0 and feasible.",
+                "After last training attempt, require report generation with leaderboard and concise final narrative.",
+            ]
+        )
     if require_web_search:
         rules.append("Before final recommendation, run at least one web search and use it to validate or challenge the plan.")
 
@@ -1014,6 +1260,10 @@ def collect_context(
     data_source_root: str,
     worker_mission_path: pathlib.Path,
     mentor_mission_path: pathlib.Path,
+    finishup_control_path: pathlib.Path,
+    finishup_report_script: pathlib.Path,
+    finishup_default_minutes_left: int,
+    finishup_default_report_top_k: int,
 ) -> dict[str, Any]:
     loop_dir = workspace_root / ".llm_loop"
     logs_dir = loop_dir / "logs"
@@ -1024,6 +1274,15 @@ def collect_context(
     workpad_path = ensure_workpad_file(loop_dir)
     mentor_notes_path, shared_todo_path = ensure_coordination_files(loop_dir)
     storyline_path = artifacts_dir / "storyline.md"
+    finishup_context = collect_finishup_context(
+        workspace_root=workspace_root,
+        state=state,
+        events_path=events_path,
+        finishup_control_path=finishup_control_path,
+        finishup_report_script=finishup_report_script,
+        finishup_default_minutes_left=finishup_default_minutes_left,
+        finishup_default_report_top_k=finishup_default_report_top_k,
+    )
     unresolved_shared_todo_count = count_unresolved_shared_todos(shared_todo_path)
     latest_logs = []
     for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:6]:
@@ -1127,8 +1386,11 @@ def collect_context(
     recent_window = recent_categories[-8:] if recent_categories else []
     micro_tune_categories = {"evaluation", "optimization", "loss", "data_sampling"}
     structural_categories = {"model_arch", "preprocessing", "augmentation"}
+    data_centric_categories = {"preprocessing", "augmentation", "data_sampling"}
     micro_tune_count = sum(1 for c in recent_window if c in micro_tune_categories)
     structural_count = sum(1 for c in recent_window if c in structural_categories)
+    recent_data_centric_count = sum(1 for c in recent_window if c in data_centric_categories)
+    data_centric_gap = len(recent_window) >= 6 and recent_data_centric_count == 0
     micro_tuning_drift = len(recent_window) >= 6 and micro_tune_count >= 6 and structural_count <= 2
 
     model_mentions: Counter[str] = Counter()
@@ -1244,6 +1506,8 @@ def collect_context(
             "repeated_category_streak": repeated_category_streak,
             "non_improving_streak": non_improving_streak,
             "diversify_hint": diversify_hint,
+            "recent_data_centric_count_8": recent_data_centric_count,
+            "data_centric_gap": data_centric_gap,
             "target_categories": [
                 "preprocessing",
                 "augmentation",
@@ -1312,6 +1576,7 @@ def collect_context(
             "shared_todo": str(shared_todo_path),
             "unresolved_shared_todo_count": unresolved_shared_todo_count,
         },
+        "finishup_context": finishup_context,
     }
 
 
@@ -2388,6 +2653,20 @@ def main() -> None:
         cfg.get("auto_repair_model_fallback_map"),
         DEFAULT_AUTO_REPAIR_MODEL_FALLBACK_MAP,
     )
+    finishup_control_file = str(cfg.get("finishup_control_file", DEFAULT_FINISHUP_CONTROL_FILE)).strip()
+    finishup_report_script_rel = str(cfg.get("finishup_report_script", DEFAULT_FINISHUP_REPORT_SCRIPT)).strip()
+    try:
+        finishup_default_minutes_left = int(cfg.get("finishup_default_minutes_left", 60))
+    except Exception:
+        finishup_default_minutes_left = 60
+    finishup_default_minutes_left = max(5, finishup_default_minutes_left)
+    try:
+        finishup_default_report_top_k = int(cfg.get("finishup_default_report_top_k", 10))
+    except Exception:
+        finishup_default_report_top_k = 10
+    finishup_default_report_top_k = max(3, min(20, finishup_default_report_top_k))
+    finishup_control_path = resolve_config_path(workspace_root, finishup_control_file, DEFAULT_FINISHUP_CONTROL_FILE)
+    finishup_report_script = resolve_config_path(workspace_root, finishup_report_script_rel, DEFAULT_FINISHUP_REPORT_SCRIPT)
     try:
         mentor_every_n_cycles = int(cfg.get("mentor_every_n_cycles", 2))
     except Exception:
@@ -2419,6 +2698,10 @@ def main() -> None:
         data_source_root=data_source_root,
         worker_mission_path=worker_mission_path,
         mentor_mission_path=mentor_mission_path,
+        finishup_control_path=finishup_control_path,
+        finishup_report_script=finishup_report_script,
+        finishup_default_minutes_left=finishup_default_minutes_left,
+        finishup_default_report_top_k=finishup_default_report_top_k,
     )
     cycle_index = count_jsonl_rows(events_file) + 1
     mentor_due, mentor_reasons = should_run_mentor(
@@ -2431,6 +2714,8 @@ def main() -> None:
     context["bootstrap_command"] = bootstrap_command
     context["bootstrap_label"] = bootstrap_label
     context["force_bootstrap_if_idle"] = force_bootstrap_if_idle
+    context["finishup_control_file"] = str(finishup_control_path)
+    context["finishup_report_script"] = str(finishup_report_script)
     prompt = build_prompt(
         run_id=run_id,
         context=context,
@@ -2581,6 +2866,7 @@ def main() -> None:
         "action": action,
         "idea_category": idea_category,
         "rationale": rationale,
+        "finishup": context.get("finishup_context") if isinstance(context.get("finishup_context"), dict) else {},
         "decision_source": "mentor" if mentor_applied else "primary",
         "quality_gate": {
             "source": effective_quality_source,

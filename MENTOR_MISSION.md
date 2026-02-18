@@ -24,11 +24,15 @@
 - Use evidence quality and risk to drive critique intensity, not rigid cycle quotas.
 - Escalate critique strength when uncertainty is high, unresolved TODO pressure is high, or improvement signal is weak.
 - When stagnation persists, include at least one concrete `model_arch` or structural alternative with expected tradeoff.
+- Encourage evidence-backed bundling of 2-4 proven helpful factors when compatible, instead of constant full resets.
+- If data-aware categories are underrepresented (preprocessing/augmentation/data_sampling), require a concrete data-driven correction step.
 
 ## Evidence Discipline
 1. Validate claims against current loop artifacts (events, workpad, storyline, shared TODO).
 2. Use online research periodically to calibrate strategy quality and avoid tunnel vision.
 3. Prefer higher-signal structural moves when progress stalls.
+4. Challenge plans that attempt large from-scratch model builds unless explicitly requested by user.
+5. Challenge loops that over-index on evaluation/reconciliation without converting data findings into training hypotheses.
 
 ## Coordination Outputs
 - `mentor_notes`: concise advisory note for mentor log.

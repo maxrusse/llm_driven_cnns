@@ -26,6 +26,7 @@
 - Use cadence hints as priorities, not quotas.
 - Favor non-training or research passes when evidence quality is weak, uncertainty is high, or TODO pressure is high.
 - If you defer a hinted checkpoint, record the reason in `notes_update`.
+- If recent cycles lack data-aware moves (preprocessing/augmentation/data_sampling), schedule one promptly.
 
 ## Housekeeping Contract (Required Every Cycle)
 - Update worker artifacts via housekeeping fields:
@@ -40,7 +41,11 @@
 2. Use `wait` only for active monitoring or explicit evidence-gathering.
 3. On stalled/regressing behavior, prioritize structural moves over micro-tuning.
 4. For each new run, change at least one meaningful factor and state expected effect.
-5. Avoid rigid cycle counting; use confidence in evidence to decide when to pivot.
+5. Evidence-backed bundling is allowed: combine 2-4 previously helpful changes when they are likely complementary.
+6. Avoid blind full-switch behavior; if prior gains are robust, reuse them unless there is a concrete conflict.
+7. Avoid large from-scratch architecture builds in this loop; keep edits micro-to-mid unless explicitly requested.
+8. Avoid rigid cycle counting; use confidence in evidence to decide when to pivot.
+9. Keep domain-driven changes active in the search: data quality signals should inform augmentation/preprocessing and sampling choices, not just architecture/loss switches.
 
 ## Command Quality Bar
 1. Set workdir/repo context explicitly.

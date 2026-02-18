@@ -9,6 +9,7 @@ $state = Join-Path $WorkspaceRoot ".llm_loop\\state.json"
 $events = Join-Path $WorkspaceRoot ".llm_loop\\logs\\events.jsonl"
 $storyline = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\storyline.md"
 $workpad = Join-Path $WorkspaceRoot ".llm_loop\\artifacts\\workpad.md"
+$finishup = Join-Path $WorkspaceRoot ".llm_loop\\FINISH_UP.json"
 $stateObj = $null
 $activePid = $null
 $activeRunAlive = $false
@@ -69,6 +70,26 @@ if (Test-Path $state) {
     } else {
         Get-Content -Path $state
     }
+}
+
+if (Test-Path $finishup) {
+    Write-Host ""
+    Write-Host "Finish-up request:"
+    $finishRaw = Get-Content -Path $finishup -Raw
+    Write-Host $finishRaw
+    try {
+        $f = $finishRaw | ConvertFrom-Json
+        if ($f.activate_at_utc) {
+            $activateAt = [DateTimeOffset]::Parse([string]$f.activate_at_utc)
+            $activateLeft = [Math]::Round(($activateAt - [DateTimeOffset]::UtcNow).TotalMinutes, 2)
+            Write-Host ("Finish-up activation in (UTC min): " + $activateLeft)
+        }
+        if ($f.deadline_utc) {
+            $deadline = [DateTimeOffset]::Parse([string]$f.deadline_utc)
+            $left = [Math]::Round(($deadline - [DateTimeOffset]::UtcNow).TotalMinutes, 2)
+            Write-Host ("Finish-up minutes left (UTC): " + $left)
+        }
+    } catch {}
 }
 
 if (Test-Path $storyline) {

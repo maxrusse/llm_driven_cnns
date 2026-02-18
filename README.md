@@ -138,6 +138,55 @@ Clone map format (optional):
 
 Auto-repair evidence is written into cycle events under `auto_repair` and retry outcomes under `run_outcome_retry`.
 
+## Finish-Up Mode (Last Hour + Final Report)
+Trigger finish-up when you want one last focused round and then final reporting:
+```powershell
+.\scripts\request_finishup.ps1 -MinutesLeft 60 -FinalTrainingRounds 1 -TopK 10 -Note "final hour"
+```
+
+Schedule finish-up in advance (example: run 8h total, last 1h is finish-up):
+```powershell
+.\scripts\request_finishup.ps1 -RunHours 8 -MinutesLeft 60 -FinalTrainingRounds 1 -TopK 10 -Note "overnight schedule"
+```
+
+Alternative schedule flags:
+- `-ActivateInMinutes <N>`
+- `-ActivateAtUtc "2026-02-18T22:00:00Z"`
+
+Or set it directly at startup:
+```powershell
+.\scripts\startup.ps1 -StartInNewWindow -RunHours 8 -FinishupMinutes 60 -FinishupFinalTrainingRounds 1 -FinishupTopK 10 -FinishupNote "overnight run"
+```
+
+What this does:
+- Writes `.llm_loop/FINISH_UP.json`.
+- Worker + mentor prompts become deadline-aware.
+- If feasible: one final high-value training/fine-tune round.
+- Then: report generation with condensed story, paper-style report, and top-k leaderboard.
+
+Status / control:
+```powershell
+.\scripts\status.ps1
+.\scripts\request_finishup.ps1 -Show
+.\scripts\request_finishup.ps1 -Cancel
+```
+
+Force report-only mode (skip final training):
+```powershell
+.\scripts\request_finishup.ps1 -ForceReportNow -TopK 10 -Note "report now"
+```
+
+Manual report generation command:
+```powershell
+python .\scripts\generate_finishup_report.py --workspace-root C:\Users\Max\code\llm_driven_cnns --top-k 10
+```
+
+Output artifacts:
+- `.llm_loop/artifacts/final_condensed_story.md`
+- `.llm_loop/artifacts/final_paper_report.md`
+- `.llm_loop/artifacts/final_leaderboard_top10.json`
+- `.llm_loop/artifacts/final_leaderboard_top10.md`
+
 ## Fresh Reset
 ```powershell
 .\scripts\clean_fresh.ps1

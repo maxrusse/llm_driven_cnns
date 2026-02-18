@@ -68,6 +68,7 @@ Continuously audit and translate findings into hypotheses:
 2. label quality issues (empty/tiny masks, suspicious artifacts)
 3. heterogeneity (resolution/view/acquisition style)
 4. positive-case strata and hard negatives
+5. convert findings into concrete data-aware experiments (augmentation/preprocessing/sampling), not analysis-only notes
 
 ## Experiment Cadence
 1. Start with short orientation, then quickly move to informative budgets.
@@ -75,6 +76,8 @@ Continuously audit and translate findings into hypotheses:
 3. Avoid train-only drift; insert non-training exploration/research cycles.
 4. If plateau/regression persists, prioritize structural moves over threshold/LR micro-tuning.
 5. Treat cadence as evidence-driven guidance, not fixed cycle quotas.
+6. Reuse and combine proven helpful features when compatible (small/mid bundles), instead of always hard-switching.
+7. Avoid from-scratch full-model builds in-loop unless explicitly requested.
 
 ## Research Behavior
 1. Perform regular online research when progress is weak, stalled, or uncertain.
