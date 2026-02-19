@@ -62,6 +62,8 @@ INTERACTION_MODE_STANDARD = "standard"
 INTERACTION_MODE_BUILDER_HEALTH_HELPER = "builder_health_helper"
 WORKER_RULE_BUDGET = 12
 MENTOR_RULE_BUDGET = 8
+DEFAULT_STALE_ORPHAN_IDLE_CYCLES = 3
+DEFAULT_STUCK_WAIT_RECOVERY_CYCLES = 8
 
 
 def utc_now() -> str:
@@ -857,6 +859,162 @@ def is_training_command_text(text: str) -> bool:
     return any(h in t for h in hints)
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _iso_utc_from_epoch(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def get_log_signature(path_str: str) -> dict[str, Any]:
+    txt = str(path_str or "").strip()
+    if not txt:
+        return {"exists": False, "size": -1, "mtime_utc": ""}
+    try:
+        p = pathlib.Path(txt)
+        if not p.exists():
+            return {"exists": False, "size": -1, "mtime_utc": ""}
+        st = p.stat()
+        return {
+            "exists": True,
+            "size": int(st.st_size),
+            "mtime_utc": _iso_utc_from_epoch(st.st_mtime),
+        }
+    except Exception:
+        return {"exists": False, "size": -1, "mtime_utc": ""}
+
+
+def init_orphan_watch_from_run(active_run: dict[str, Any], *, now_utc: str, source: str) -> dict[str, Any]:
+    stderr_log = str(active_run.get("stderr_log", "")).strip()
+    stdout_log = str(active_run.get("stdout_log", "")).strip()
+    sig = get_log_signature(stderr_log or stdout_log)
+    return {
+        "pid": _safe_int(active_run.get("pid", 0), 0),
+        "run_label": str(active_run.get("run_label", "")).strip(),
+        "command": str(active_run.get("command", "")).strip(),
+        "stdout_log": stdout_log,
+        "stderr_log": stderr_log,
+        "source": source,
+        "first_seen_utc": now_utc,
+        "last_checked_utc": now_utc,
+        "last_growth_utc": (now_utc if bool(sig.get("exists", False)) else ""),
+        "last_size": _safe_int(sig.get("size", -1), -1),
+        "last_mtime_utc": str(sig.get("mtime_utc", "")).strip(),
+        "idle_cycles": 0,
+        "stale": False,
+        "grew_last_check": False,
+        "completion_recorded": False,
+    }
+
+
+def refresh_orphan_watch(
+    state: dict[str, Any],
+    *,
+    now_utc: str,
+    stale_idle_cycles: int,
+) -> dict[str, Any] | None:
+    raw = state.get("orphan_watch")
+    if not isinstance(raw, dict):
+        return None
+    watch = dict(raw)
+
+    log_path = str(watch.get("stderr_log", "")).strip() or str(watch.get("stdout_log", "")).strip()
+    sig = get_log_signature(log_path)
+    prev_size = _safe_int(watch.get("last_size", -1), -1)
+    prev_mtime = str(watch.get("last_mtime_utc", "")).strip()
+
+    grew = False
+    if bool(sig.get("exists", False)):
+        size_now = _safe_int(sig.get("size", -1), -1)
+        mtime_now = str(sig.get("mtime_utc", "")).strip()
+        if size_now > prev_size:
+            grew = True
+        elif size_now == prev_size and bool(mtime_now) and mtime_now != prev_mtime:
+            grew = True
+    idle_cycles = 0 if grew else (_safe_int(watch.get("idle_cycles", 0), 0) + 1)
+    stale = idle_cycles >= max(1, int(stale_idle_cycles))
+
+    watch["last_checked_utc"] = now_utc
+    watch["last_size"] = _safe_int(sig.get("size", -1), -1)
+    watch["last_mtime_utc"] = str(sig.get("mtime_utc", "")).strip()
+    watch["idle_cycles"] = idle_cycles
+    watch["stale"] = bool(stale)
+    watch["grew_last_check"] = bool(grew)
+    if grew:
+        watch["last_growth_utc"] = now_utc
+
+    if stale and not bool(watch.get("completion_recorded", False)):
+        state["last_completed_run"] = {
+            "ended_utc": now_utc,
+            "status": "orphan_reconciled_idle",
+            "run_label": watch.get("run_label", ""),
+            "command": watch.get("command", ""),
+            "outcome": {
+                "status": "orphan_reconciled_idle",
+                "stdout_log": watch.get("stdout_log", ""),
+                "stderr_log": watch.get("stderr_log", ""),
+            },
+        }
+        watch["completion_recorded"] = True
+
+    state["orphan_watch"] = watch
+    return watch
+
+
+def _append_output_dir_suffix(command: str, suffix: str) -> str:
+    cmd = str(command or "")
+    if not cmd.strip():
+        return ""
+    patt = re.compile(r"(--output-dir\s+)(['\"])(.+?)\2", flags=re.IGNORECASE)
+
+    def repl(m: re.Match[str]) -> str:
+        prefix = m.group(1)
+        quote = m.group(2)
+        raw_val = m.group(3)
+        if raw_val.endswith(suffix):
+            new_val = raw_val
+        else:
+            new_val = raw_val + suffix
+        return f"{prefix}{quote}{new_val}{quote}"
+
+    updated, n = patt.subn(repl, cmd, count=1)
+    if n > 0:
+        return updated
+    return cmd
+
+
+def choose_wait_recovery_launch(
+    *,
+    orphan_watch: dict[str, Any] | None,
+    bootstrap_command: str,
+    cycle_index: int,
+) -> tuple[str, str, str]:
+    suffix = f"_recovery_c{cycle_index:04d}"
+    if isinstance(orphan_watch, dict):
+        base_cmd = str(orphan_watch.get("command", "")).strip()
+        if base_cmd:
+            run_label = str(orphan_watch.get("run_label", "")).strip() or "orphan_run"
+            return (
+                _append_output_dir_suffix(base_cmd, suffix),
+                f"{run_label}_recovery".strip("_"),
+                "orphan_replay",
+            )
+    if str(bootstrap_command or "").strip():
+        return (
+            _append_output_dir_suffix(str(bootstrap_command).strip(), suffix),
+            f"recovery_bootstrap_c{cycle_index:04d}",
+            "bootstrap_fallback",
+        )
+    return "", "", "none"
+
+
 def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1110,6 +1268,7 @@ def build_prompt(
         "Never tune on test split; never execute nnU-Net/nnUNet/nnUNetv2 in this loop.",
         "At cycle start, re-check active_run, last_completed_run, recent events, and mission goals.",
         "If active run is unhealthy/blocked, prefer stop_current_run; if idle and clear, prefer run_command over wait.",
+        "If orphan_watch is stale and no active_run exists, avoid repeated wait loops; recover with run_command.",
         "Keep housekeeping minimal and execution-first; resolve existing shared_todo IDs before adding new ones.",
         "Use evidence-driven category diversity; avoid repeated micro-tuning without meaningful changes.",
         "Allowed tuning knobs: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.",
@@ -1152,6 +1311,8 @@ def build_prompt(
         "workpad_text": context.get("workpad_text", ""),
         "mentor_notes_tail": context.get("mentor_notes_tail", ""),
         "finishup_context": context.get("finishup_context", {}),
+        "orphan_watch": context.get("orphan_watch", {}),
+        "orphan_recovery_due": bool(context.get("orphan_recovery_due", False)),
     }
 
     prompt = {
@@ -1232,6 +1393,8 @@ def build_mentor_prompt(
         "shared_todo_tail": context.get("shared_todo_tail", ""),
         "recent_events_tail": context.get("recent_events_tail", ""),
         "finishup_context": finishup_context if isinstance(finishup_context, dict) else {},
+        "orphan_watch": context.get("orphan_watch", {}),
+        "orphan_recovery_due": bool(context.get("orphan_recovery_due", False)),
     }
     if mentor_health_helper_mode:
         rules = [
@@ -1695,6 +1858,19 @@ def collect_context(
         cycles_since_last_run_command += 1
     if not seen_run_command:
         cycles_since_last_run_command = len(recent_events)
+    cycles_since_last_run_command_summary = 0
+    seen_run_command_summary = False
+    for s in reversed(long_summaries):
+        if str(s.get("action", "")).strip().lower() == "run_command":
+            seen_run_command_summary = True
+            break
+        cycles_since_last_run_command_summary += 1
+    if not seen_run_command_summary:
+        cycles_since_last_run_command_summary = len(long_summaries)
+    cycles_since_last_run_command_effective = max(
+        cycles_since_last_run_command,
+        cycles_since_last_run_command_summary,
+    )
     unresolved_todo_pressure = clamp01(float(unresolved_shared_todo_count) / 8.0)
     research_priority = clamp01(
         0.14 * float(consecutive_training_runs)
@@ -1765,6 +1941,8 @@ def collect_context(
             "consecutive_training_runs": consecutive_training_runs,
             "cycles_since_last_web_search": cycles_since_last_web_search,
             "cycles_since_last_run_command": cycles_since_last_run_command,
+            "cycles_since_last_run_command_summary": cycles_since_last_run_command_summary,
+            "cycles_since_last_run_command_effective": cycles_since_last_run_command_effective,
             "research_pass_due": research_pass_due,
             "non_training_cycle_due": non_training_cycle_due,
             "research_priority": research_priority,
@@ -2783,6 +2961,16 @@ def main() -> None:
     mentor_challenge_streak_min_idle_cycles = max(0, mentor_challenge_streak_min_idle_cycles)
     mentor_apply_suggestions = bool(cfg.get("mentor_apply_suggestions", True))
     mentor_require_web_search = bool(cfg.get("mentor_require_web_search", True))
+    try:
+        stale_orphan_idle_cycles = int(cfg.get("stale_orphan_idle_cycles", DEFAULT_STALE_ORPHAN_IDLE_CYCLES))
+    except Exception:
+        stale_orphan_idle_cycles = DEFAULT_STALE_ORPHAN_IDLE_CYCLES
+    stale_orphan_idle_cycles = max(1, stale_orphan_idle_cycles)
+    try:
+        stuck_wait_recovery_cycles = int(cfg.get("stuck_wait_recovery_cycles", DEFAULT_STUCK_WAIT_RECOVERY_CYCLES))
+    except Exception:
+        stuck_wait_recovery_cycles = DEFAULT_STUCK_WAIT_RECOVERY_CYCLES
+    stuck_wait_recovery_cycles = max(2, stuck_wait_recovery_cycles)
     worker_display_name = str(cfg.get("worker_display_name", "AI-Builder")).strip() or "AI-Builder"
     mentor_display_name = str(cfg.get("mentor_display_name", "AI-Mentor")).strip() or "AI-Mentor"
     auto_repair_enabled = bool(cfg.get("auto_repair_enabled", True))
@@ -2853,10 +3041,24 @@ def main() -> None:
     state = read_json(state_file, {"active_run": None})
     if not isinstance(state, dict):
         state = {"active_run": None}
+    now_state_utc = utc_now()
     active = state.get("active_run")
     if isinstance(active, dict) and isinstance(active.get("pid"), int):
         if not is_pid_running(int(active["pid"])):
+            if not isinstance(state.get("orphan_watch"), dict):
+                state["orphan_watch"] = init_orphan_watch_from_run(
+                    active,
+                    now_utc=now_state_utc,
+                    source="active_pid_not_running",
+                )
             state["active_run"] = None
+        else:
+            state.pop("orphan_watch", None)
+    orphan_watch = refresh_orphan_watch(
+        state,
+        now_utc=now_state_utc,
+        stale_idle_cycles=stale_orphan_idle_cycles,
+    )
 
     context = collect_context(
         workspace_root=workspace_root,
@@ -2887,6 +3089,12 @@ def main() -> None:
     context["bootstrap_command"] = bootstrap_command
     context["bootstrap_label"] = bootstrap_label
     context["force_bootstrap_if_idle"] = force_bootstrap_if_idle
+    context["stale_orphan_idle_cycles"] = stale_orphan_idle_cycles
+    context["stuck_wait_recovery_cycles"] = stuck_wait_recovery_cycles
+    context["orphan_watch"] = orphan_watch if isinstance(orphan_watch, dict) else {}
+    context["orphan_recovery_due"] = bool(
+        isinstance(orphan_watch, dict) and bool(orphan_watch.get("stale", False))
+    )
     context["finishup_control_file"] = str(finishup_control_path)
     context["finishup_report_script"] = str(finishup_report_script)
     prompt = build_prompt(
@@ -3102,6 +3310,55 @@ def main() -> None:
         and isinstance(active.get("pid"), int)
         and is_pid_running(int(active["pid"]))
     )
+    exploration_cadence_ctx = context.get("exploration_cadence_context")
+    cycles_since_last_run_command = 0
+    cycles_since_last_run_command_effective = 0
+    if isinstance(exploration_cadence_ctx, dict):
+        cycles_since_last_run_raw = safe_float(exploration_cadence_ctx.get("cycles_since_last_run_command"))
+        if cycles_since_last_run_raw is not None:
+            cycles_since_last_run_command = max(0, int(cycles_since_last_run_raw))
+        cycles_since_last_run_effective_raw = safe_float(
+            exploration_cadence_ctx.get("cycles_since_last_run_command_effective")
+        )
+        if cycles_since_last_run_effective_raw is not None:
+            cycles_since_last_run_command_effective = max(0, int(cycles_since_last_run_effective_raw))
+    if cycles_since_last_run_command_effective <= 0:
+        cycles_since_last_run_command_effective = cycles_since_last_run_command
+    orphan_watch_state = state.get("orphan_watch") if isinstance(state.get("orphan_watch"), dict) else None
+    orphan_recovery_due = bool(orphan_watch_state and bool(orphan_watch_state.get("stale", False)))
+
+    if action == "wait" and no_active_live:
+        stuck_due_to_wait_cycles = cycles_since_last_run_command_effective >= stuck_wait_recovery_cycles
+        if orphan_recovery_due or stuck_due_to_wait_cycles:
+            rec_cmd, rec_label, rec_source = choose_wait_recovery_launch(
+                orphan_watch=orphan_watch_state,
+                bootstrap_command=bootstrap_command,
+                cycle_index=cycle_index,
+            )
+            if rec_cmd:
+                action = "run_command"
+                command = rec_cmd
+                run_label = rec_label
+                monitor_seconds = max(monitor_seconds, default_monitor_seconds)
+                cycle_result["action"] = action
+                cycle_result["rationale"] = (
+                    (rationale + " | ") if rationale else ""
+                ) + (
+                    "forced wait-recovery launch after stale orphan or prolonged idle wait loop"
+                )
+                cycle_result["forced_wait_recovery"] = {
+                    "source": rec_source,
+                    "orphan_recovery_due": orphan_recovery_due,
+                    "cycles_since_last_run_command": cycles_since_last_run_command,
+                    "cycles_since_last_run_command_effective": cycles_since_last_run_command_effective,
+                    "stuck_wait_recovery_cycles": stuck_wait_recovery_cycles,
+                }
+                cycle_result["idea_category"] = infer_idea_category(
+                    rationale=cycle_result.get("rationale", ""),
+                    command=command,
+                    run_label=run_label,
+                )
+
     if (
         force_bootstrap_if_idle
         and action == "wait"
@@ -3169,6 +3426,7 @@ def main() -> None:
                 cycle_result["result"] = "active_run_exists"
                 cycle_result["active_pid"] = int(active["pid"])
             else:
+                state.pop("orphan_watch", None)
                 initial_outcome = run_new_command(
                     workspace_root=workspace_root,
                     command=command,
