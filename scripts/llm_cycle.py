@@ -10,6 +10,7 @@ import subprocess
 import time
 import uuid
 from collections import Counter, deque
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -53,6 +54,14 @@ DEFAULT_AUTO_REPAIR_MODEL_FALLBACK_MAP: dict[str, str] = {
 }
 DEFAULT_FINISHUP_CONTROL_FILE = ".llm_loop/FINISH_UP.json"
 DEFAULT_FINISHUP_REPORT_SCRIPT = "scripts/generate_finishup_report.py"
+TODO_BACKLOG_SOFT_LIMIT = 24
+TODO_BACKLOG_HARD_LIMIT = 48
+TODO_NEAR_DUP_RATIO = 0.84
+TODO_MIN_WORDS = 5
+INTERACTION_MODE_STANDARD = "standard"
+INTERACTION_MODE_BUILDER_HEALTH_HELPER = "builder_health_helper"
+WORKER_RULE_BUDGET = 12
+MENTOR_RULE_BUDGET = 8
 
 
 def utc_now() -> str:
@@ -140,6 +149,36 @@ def parse_utc_iso(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def normalize_interaction_mode(raw_value: Any) -> str:
+    mode = str(raw_value or "").strip().lower()
+    aliases = {
+        INTERACTION_MODE_STANDARD: INTERACTION_MODE_STANDARD,
+        "default": INTERACTION_MODE_STANDARD,
+        "classic": INTERACTION_MODE_STANDARD,
+        INTERACTION_MODE_BUILDER_HEALTH_HELPER: INTERACTION_MODE_BUILDER_HEALTH_HELPER,
+        "builder_mode": INTERACTION_MODE_BUILDER_HEALTH_HELPER,
+        "builder": INTERACTION_MODE_BUILDER_HEALTH_HELPER,
+        "builder_only": INTERACTION_MODE_BUILDER_HEALTH_HELPER,
+        "mentor_health_helper": INTERACTION_MODE_BUILDER_HEALTH_HELPER,
+    }
+    return aliases.get(mode, INTERACTION_MODE_STANDARD)
+
+
+def dedupe_and_limit_rules(rules: list[str], max_items: int) -> list[str]:
+    cap = max(1, int(max_items))
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in rules:
+        txt = " ".join(str(raw or "").strip().split())
+        if not txt or txt in seen:
+            continue
+        seen.add(txt)
+        out.append(txt)
+        if len(out) >= cap:
+            break
+    return out
 
 
 def resolve_config_path(base_dir: pathlib.Path, raw_path: str, default_rel: str) -> pathlib.Path:
@@ -392,27 +431,150 @@ def count_unresolved_shared_todos(shared_todo_path: pathlib.Path) -> int:
         return 0
 
 
-def summarize_recent_open_shared_todos(
-    shared_todo_path: pathlib.Path,
-    *,
-    max_items: int = 10,
-    max_chars: int = 4000,
-) -> str:
-    if not shared_todo_path.exists():
+def normalize_todo_text(text: str) -> str:
+    s = str(text or "").strip().lower()
+    if not s:
         return ""
+    s = re.sub(r"\[[^\]]+\]", " ", s)
+    s = re.sub(r"\bc\d{4}\b", " ", s)
+    s = re.sub(r"\d+", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    stop = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "then",
+        "than",
+        "after",
+        "before",
+        "when",
+        "into",
+        "only",
+        "still",
+        "run",
+        "cycle",
+    }
+    toks = [t for t in s.split() if len(t) >= 3 and t not in stop]
+    if not toks:
+        return ""
+    return " ".join(toks[:40])
+
+
+def parse_open_shared_todos(shared_todo_path: pathlib.Path) -> list[dict[str, str]]:
+    if not shared_todo_path.exists():
+        return []
+    out: list[dict[str, str]] = []
     try:
-        recent_open: deque[str] = deque(maxlen=max(1, int(max_items)))
         with shared_todo_path.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 s = line.strip()
                 if not s.startswith("- [ ]"):
                     continue
-                recent_open.append(" ".join(s.split())[:280])
+                id_match = re.search(r"\[([A-Za-z0-9\-]+)\]", s)
+                todo_id = str(id_match.group(1)).strip() if id_match else ""
+                text = s
+                if ":" in s:
+                    text = s.split(":", 1)[1].strip()
+                norm = normalize_todo_text(text)
+                out.append(
+                    {
+                        "id": todo_id,
+                        "text": " ".join(text.split())[:280],
+                        "norm": norm,
+                        "raw": " ".join(s.split())[:280],
+                    }
+                )
     except Exception:
+        return []
+    return out
+
+
+def is_todo_near_duplicate(candidate_norm: str, existing_norms: list[str]) -> bool:
+    c = str(candidate_norm or "").strip()
+    if not c:
+        return False
+    for existing in existing_norms:
+        e = str(existing or "").strip()
+        if not e:
+            continue
+        if c == e:
+            return True
+        try:
+            if SequenceMatcher(a=c, b=e).ratio() >= TODO_NEAR_DUP_RATIO:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def todo_addition_limit_from_backlog(unresolved_open: int, base_limit: int) -> int:
+    base = max(0, int(base_limit))
+    if unresolved_open >= TODO_BACKLOG_HARD_LIMIT:
+        return min(base, 1)
+    if unresolved_open >= TODO_BACKLOG_SOFT_LIMIT:
+        return min(base, 2)
+    return base
+
+
+def summarize_recent_open_shared_todos(
+    shared_todo_path: pathlib.Path,
+    *,
+    max_items: int = 12,
+    max_chars: int = 4000,
+) -> str:
+    items = parse_open_shared_todos(shared_todo_path)
+    if not items:
         return ""
-    if not recent_open:
-        return ""
-    txt = "\n".join(recent_open)
+
+    cap = max(4, int(max_items))
+    persistent_take = max(2, min(6, cap // 2))
+    recent_take = max(2, cap - persistent_take)
+
+    selected: list[dict[str, str]] = []
+    selected_norms: list[str] = []
+
+    # Keep a small oldest-open slice so long-standing priorities remain visible.
+    for item in items[:persistent_take]:
+        norm = str(item.get("norm", "")).strip()
+        if is_todo_near_duplicate(norm, selected_norms):
+            continue
+        selected.append(item)
+        selected_norms.append(norm)
+
+    # Add latest-open slice for current-cycle relevance.
+    for item in items[-recent_take:]:
+        norm = str(item.get("norm", "")).strip()
+        if is_todo_near_duplicate(norm, selected_norms):
+            continue
+        selected.append(item)
+        selected_norms.append(norm)
+        if len(selected) >= cap:
+            break
+
+    # Fill remaining slots from newest backwards without duplicates.
+    if len(selected) < cap:
+        for item in reversed(items):
+            norm = str(item.get("norm", "")).strip()
+            if is_todo_near_duplicate(norm, selected_norms):
+                continue
+            selected.append(item)
+            selected_norms.append(norm)
+            if len(selected) >= cap:
+                break
+
+    lines = [f"open_total={len(items)} | focus_view={len(selected)}"]
+    for item in selected:
+        tid = str(item.get("id", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if tid:
+            lines.append(f"- [{tid}] {text}")
+        else:
+            lines.append(f"- {text}")
+    txt = "\n".join(lines)
     if len(txt) <= max_chars:
         return txt
     return txt[-max_chars:]
@@ -508,16 +670,28 @@ def append_shared_todo_entries(
 ) -> int:
     if not items:
         return 0
+    open_before = parse_open_shared_todos(shared_todo_path)
+    unresolved_open = len(open_before)
+    dynamic_max = todo_addition_limit_from_backlog(unresolved_open, max_items)
+    if dynamic_max <= 0:
+        return 0
+    existing_norms = [str(x.get("norm", "")).strip() for x in open_before if str(x.get("norm", "")).strip()]
     token = "".join(ch for ch in str(owner_token).upper() if ch.isalnum())[:1] or "W"
     added = 0
     with shared_todo_path.open("a", encoding="utf-8") as f:
-        for idx, item in enumerate(items[:max_items], start=1):
+        for idx, item in enumerate(items[:dynamic_max], start=1):
             clean = " ".join(str(item).strip().split())
             if not clean:
+                continue
+            norm = normalize_todo_text(clean)
+            if len(norm.split()) < TODO_MIN_WORDS:
+                continue
+            if is_todo_near_duplicate(norm, existing_norms):
                 continue
             todo_id = f"C{cycle_index:04d}-{token}{idx:02d}"
             f.write(f"- [ ] [{todo_id}] {role_label}: {clean[:220]}\n")
             added += 1
+            existing_norms.append(norm)
         if added:
             f.write("\n")
     return added
@@ -544,7 +718,7 @@ def append_worker_housekeeping_artifacts(
         resolve_ids = []
 
     todo_items = []
-    for item in todo_new[:4]:
+    for item in todo_new[:2]:
         clean = " ".join(str(item).strip().split())
         if clean:
             todo_items.append(clean[:220])
@@ -600,13 +774,15 @@ def append_mentor_coordination_artifacts(
     with mentor_notes_path.open("a", encoding="utf-8") as f:
         f.write("\n".join(note_lines))
 
+    rec = str(mentor_recommendation or "").strip().lower()
+    mentor_todo_cap = 1 if rec == "challenge" else 0
     added = append_shared_todo_entries(
         shared_todo_path,
         cycle_index=cycle_index,
         owner_token="M",
         role_label=mentor_display_name,
         items=[str(x).strip() for x in todo_updates],
-        max_items=6,
+        max_items=mentor_todo_cap,
     )
     unresolved = count_unresolved_shared_todos(shared_todo_path)
     return added, unresolved
@@ -734,7 +910,7 @@ def build_decision_schema() -> dict[str, Any]:
                 "properties": {
                     "todo_new": {
                         "type": "array",
-                        "maxItems": 4,
+                        "maxItems": 2,
                         "items": {"type": "string"},
                     },
                     "notes_update": {"type": "string"},
@@ -764,13 +940,13 @@ def build_mentor_output_schema() -> dict[str, Any]:
             "critique": {"type": "string"},
             "questions": {
                 "type": "array",
-                "maxItems": 3,
+                "maxItems": 1,
                 "items": {"type": "string"},
             },
             "mentor_notes": {"type": "string"},
             "todo_updates": {
                 "type": "array",
-                "maxItems": 6,
+                "maxItems": 1,
                 "items": {"type": "string"},
             },
             "suggested_decision": {
@@ -818,7 +994,7 @@ def coerce_decision(
     if not isinstance(todo_new_raw, list):
         todo_new_raw = []
     todo_new = []
-    for item in todo_new_raw[:4]:
+    for item in todo_new_raw[:2]:
         clean = " ".join(str(item).strip().split())
         if clean:
             todo_new.append(clean[:220])
@@ -862,8 +1038,8 @@ def decision_quality_issues(decision: dict[str, Any]) -> list[str]:
     if len(rationale) < 20:
         issues.append("rationale_too_short")
 
-    # For routine worker cycles, require at least one concrete housekeeping update.
-    if action in {"run_command", "wait"}:
+    # Housekeeping is encouraged, but execution should not be blocked by admin-only fields.
+    if action == "run_command":
         todo_new = hk.get("todo_new", [])
         resolve_ids = hk.get("resolve_shared_todo_ids", [])
         notes_update = str(hk.get("notes_update", "")).strip()
@@ -896,7 +1072,6 @@ def apply_decision_quality_gate(decision: dict[str, Any]) -> tuple[dict[str, Any
         key in issues
         for key in (
             "rationale_too_short",
-            "housekeeping_empty",
             "run_command_empty",
             "run_label_generic",
             "run_command_missing_repo_context",
@@ -928,75 +1103,56 @@ def build_prompt(
 ) -> str:
     finishup_context = context.get("finishup_context")
     finishup_active = isinstance(finishup_context, dict) and bool(finishup_context.get("active", False))
+    interaction_mode = normalize_interaction_mode(context.get("interaction_mode", INTERACTION_MODE_STANDARD))
+    mentor_health_helper_mode = interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER
     rules = [
-        "LLM is in the driver seat. No automatic picking outside your decision.",
-        "Do not tune on test split.",
-        "If current run looks unhealthy or blocked, prefer stop_current_run.",
-        "You may choose wait when there is not enough evidence for a new action.",
-        "Use shutdown_daemon only when run should end now.",
-        "When helpful, you may delegate to subagents conceptually; still output one action now.",
-        "Use mission/contract text as agenda and execute it step-by-step.",
-        "At the start of every cycle, re-check runtime status: active_run, last_completed_run, and recent events before deciding.",
-        "Re-check mission goals each cycle against mission_text; if goals and action diverge, correct course now.",
-        "Treat .llm_loop/artifacts/storyline.md as backup context; consult it when uncertain/stuck, not as a mandatory every-cycle read.",
-        "Use mentor_context when present: if recent mentor feedback challenged your direction, address it explicitly before repeating similar commands.",
-        "If mentor_context.search_requirement_unmet is true, run a web-search-supported cycle before another training-heavy command.",
-        "Role separation: worker owns analysis/exploration/training execution; mentor owns critique only.",
-        "Check .llm_loop/artifacts/shared_todo.md each cycle; prioritize unresolved mentor items when they are high-impact and evidence-seeking.",
-        "Use .llm_loop/artifacts/workpad.md as worker-owned notes; do not repurpose mentor notes as execution logs.",
-        "Maintain one structured workspace file at .llm_loop/artifacts/workpad.md.",
-        "Inside workpad.md, keep Notes and Data Exploration updated with concise UTC-stamped entries.",
-        "Use housekeeping.todo_new to append actionable items into the single shared queue at .llm_loop/artifacts/shared_todo.md.",
-        "Every cycle, provide housekeeping updates in the required `housekeeping` object, even if some fields are empty.",
-        "Resolve shared mentor TODOs when done by listing IDs in housekeeping.resolve_shared_todo_ids.",
-        "If there is no active run and mission goals are clear, prefer run_command over wait.",
-        "Operate like a data scientist, not only a hyperparameter tuner.",
-        "Maintain idea diversity across categories: preprocessing, augmentation, data_sampling, loss, model_arch, optimization, evaluation.",
-        "If recent runs repeat one category or metrics stagnate, choose a different category next and state why.",
-        "Always set `idea_category` for your chosen action.",
-        "Use a lightweight discovery flow: baseline -> inspect data -> quick online search for relevant strong approaches -> targeted experiments.",
-        "Use fast-dev only for initial orientation (about 1-2 cycles) to verify pipeline and learn data behavior.",
-        "After initial orientation, shift to stronger experiments and avoid lingering in tiny-budget fast-dev loops.",
-        "When unresolved, do regular online research passes and adapt generic strong patterns to this task.",
-        "Keep a dual objective: improve segmentation overlap and push fracture-presence classification metrics toward domain-competitive (SOTA-like) ranges.",
-        "Track and discuss classification behavior explicitly (presence precision/recall and calibration), not only segmentation dice.",
-        "Use online references to anchor what strong classification performance looks like in this domain, then adapt pragmatically.",
-        "Avoid train-only loops: insert regular non-training cycles for deeper data exploration and literature synthesis.",
-        "Treat exploration_cadence_context cadence flags as guidance, not hard gates.",
-        "When research_priority is high, strongly prefer a web-supported evidence cycle before additional tuning.",
-        "When non_training_priority is high, strongly prefer a non-training cycle unless there is a clear execution-critical reason not to.",
-        "Treat quick data-audit scripts as first pass only; continue deeper data exploration throughout the run.",
-        "In data exploration, include split/leakage checks, label quality checks, resolution/view heterogeneity, and positive-case strata analysis.",
-        "Translate data findings into concrete hypotheses and experiments; do not stay in threshold/LR tuning only.",
-        "When exploration_context.data_centric_gap is true, prioritize a data-aware move (preprocessing/augmentation/data_sampling) in the next actionable cycle.",
-        "Evidence-backed bundling is allowed: combine 2-4 previously helpful factors when they are compatible and testable.",
-        "Avoid blind full-switch behavior; reuse proven helpful elements unless they conflict with new evidence.",
-        "When changing architecture/loss, preserve proven data-aware settings when possible instead of resetting everything.",
-        "Architecture probes are optional (1-2 quick probes when uncertainty is high), not mandatory before data-centric work.",
-        "Shift early into data-centric exploration: include preprocessing and augmentation or data_sampling ideas before many optimizer micro-tweaks.",
-        "Fast-dev settings are for scouting only; promote promising recipes to stronger budgets quickly (more epochs/batches and broader eval) when signal is flat.",
-        "When breakout_priority is high, prioritize structural experiments over micro-tuning: supported backbones/models, head/decoder changes, and training-budget increases.",
-        "Do not attempt full from-scratch model builds in this loop unless the user explicitly asks for it.",
-        "Avoid local tuning traps by pivoting away from repeated threshold/LR-only tweaks when evidence quality is weak.",
-        "When unresolved_shared_todo_count is high, address high-impact open TODOs promptly and explain deferrals explicitly in housekeeping notes.",
-        "Keep tone practical and concise in rationale; avoid over-planning.",
-        "Hard constraint: do not execute nnU-Net/nnUNet/nnUNetv2 pipelines here (reserved for separate manual comparison).",
-        "When using internet research, extract generic strategy patterns and evidence quality signals; do not copy a turnkey pipeline verbatim.",
+        "Output exactly one action: run_command, wait, stop_current_run, or shutdown_daemon.",
+        "Never tune on test split; never execute nnU-Net/nnUNet/nnUNetv2 in this loop.",
+        "At cycle start, re-check active_run, last_completed_run, recent events, and mission goals.",
+        "If active run is unhealthy/blocked, prefer stop_current_run; if idle and clear, prefer run_command over wait.",
+        "Keep housekeeping minimal and execution-first; resolve existing shared_todo IDs before adding new ones.",
+        "Use evidence-driven category diversity; avoid repeated micro-tuning without meaningful changes.",
+        "Allowed tuning knobs: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.",
+        "Convert evidence (data + research) into concrete experiments; adapt patterns, do not copy turnkey pipelines.",
     ]
+    if mentor_health_helper_mode:
+        rules.extend(
+            [
+                "Interaction mode is builder_health_helper: you own strategy, web research, and execution end-to-end.",
+                "Treat mentor notes as advisory reminders, not a hard decision gate.",
+            ]
+        )
+    else:
+        rules.extend(
+            [
+                "If mentor challenges direction, answer with one concrete action and then evaluate; avoid back-and-forth debate loops.",
+            ]
+        )
     if finishup_active:
         rules.extend(
             [
-                "Finish-up mode is active: user requested wrap-up by deadline with mentor awareness.",
-                "If remaining_final_training_rounds > 0 and no active run, prioritize one high-confidence final training or fine-tuning run that can finish before deadline.",
-                "Do not start broad exploration loops in finish-up mode; keep decisions deadline-aware and execution-focused.",
-                "When remaining_final_training_rounds == 0 or minutes_left is low, prioritize report generation.",
-                "Use finishup_context.report_script and finishup_context.report_outputs to produce final condensed story, paper-style report, and top-k leaderboard artifacts.",
+                "Finish-up mode: be deadline-aware, run at most one final high-value train/fine-tune if feasible, then generate final reports.",
             ]
         )
     if rechallenge_on_done:
-        rules.append(
-            "If a prior run completed and no run is active, prefer a rechallenge run_command that changes one meaningful factor."
-        )
+        rules.append("After completed runs, prefer meaningful rechallenge over repetition when idle.")
+    rules = dedupe_and_limit_rules(rules, WORKER_RULE_BUDGET)
+    runtime_context = {
+        "time_utc": context.get("time_utc"),
+        "active_run": context.get("active_run"),
+        "last_completed_run": context.get("last_completed_run"),
+        "recent_events_tail": context.get("recent_events_tail", ""),
+        "exploration_context": context.get("exploration_context"),
+        "performance_context": context.get("performance_context"),
+        "breakout_context": context.get("breakout_context"),
+        "exploration_cadence_context": context.get("exploration_cadence_context"),
+        "mentor_context": context.get("mentor_context"),
+        "coordination_context": context.get("coordination_context"),
+        "shared_todo_tail": context.get("shared_todo_tail", ""),
+        "workpad_text": context.get("workpad_text", ""),
+        "mentor_notes_tail": context.get("mentor_notes_tail", ""),
+        "finishup_context": context.get("finishup_context", {}),
+    }
 
     prompt = {
         "role": "Autonomous CNN experiment driver",
@@ -1021,7 +1177,7 @@ def build_prompt(
             "workpad": ".llm_loop/artifacts/workpad.md",
             "shared_todo": ".llm_loop/artifacts/shared_todo.md",
             "housekeeping_output": {
-                "todo_new": "0-4 concise TODO bullets to append to shared_todo.md (single queue)",
+                "todo_new": "0-2 concise high-impact TODO bullets (sparse; avoid duplicates)",
                 "notes_update": "one concise note for workpad Notes (or empty string)",
                 "data_exploration_update": "one concise observation/hypothesis for Data Exploration (or empty string)",
                 "resolve_shared_todo_ids": "0-6 shared TODO IDs to mark resolved (e.g. C0002-M01)",
@@ -1040,7 +1196,7 @@ def build_prompt(
             ],
             "forbidden_execution_only": True,
         },
-        "runtime_context": context,
+        "runtime_context": runtime_context,
     }
     return json.dumps(prompt, ensure_ascii=True)
 
@@ -1054,9 +1210,14 @@ def build_mentor_prompt(
 ) -> str:
     finishup_context = context.get("finishup_context")
     finishup_active = isinstance(finishup_context, dict) and bool(finishup_context.get("active", False))
+    interaction_mode = normalize_interaction_mode(context.get("interaction_mode", INTERACTION_MODE_STANDARD))
+    mentor_health_helper_mode = interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER
+    mentor_every_n_cycles = max(1, int(context.get("mentor_every_n_cycles", 1) or 1))
     review_context = {
         "cycle_trace_id": str(context.get("cycle_trace_id", "")),
         "mentor_display_name": str(context.get("mentor_display_name", "AI-Mentor")),
+        "interaction_mode": interaction_mode,
+        "mentor_every_n_cycles": mentor_every_n_cycles,
         "time_utc": context.get("time_utc"),
         "active_run": context.get("active_run"),
         "last_completed_run": context.get("last_completed_run"),
@@ -1068,41 +1229,41 @@ def build_mentor_prompt(
         "coordination_context": context.get("coordination_context"),
         "mentor_mission_file": context.get("mentor_mission_file", context.get("mission_file")),
         "mentor_mission_text": context.get("mentor_mission_text", context.get("mission_text")),
-        "workpad_text": context.get("workpad_text", ""),
-        "mentor_notes_tail": context.get("mentor_notes_tail", ""),
         "shared_todo_tail": context.get("shared_todo_tail", ""),
-        "storyline_tail": context.get("storyline_tail", ""),
         "recent_events_tail": context.get("recent_events_tail", ""),
         "finishup_context": finishup_context if isinstance(finishup_context, dict) else {},
     }
-    rules = [
-        "Act as a critical but practical mentor reviewing the primary decision.",
-        "Role separation is strict: you are advisory and strategic only; do not take execution ownership.",
-        "Identify when the plan is too narrow, stuck, or missing evidence.",
-        "Use adaptive guidance, not rigid cadence quotas; judge by evidence quality and risk.",
-        "Ask concise critical questions only when they can change the next action.",
-        "Your output must be actionable for the worker and wrapper-managed notes/todo artifacts.",
-        "If the decision is sound, return recommendation=continue and suggested_decision=null.",
-        "If the decision is weak, return recommendation=challenge and provide a full suggested_decision.",
-        "When uncertainty remains after repeated non-improving cycles, propose at least one concrete model_arch alternative with expected tradeoff.",
-        "Challenge blind full-switch behavior when there is reusable positive evidence from prior runs.",
-        "Encourage bundling 2-4 compatible proven factors when this increases expected signal quality.",
-        "If exploration_context.data_centric_gap is true, challenge plans that skip data-aware actions (preprocessing/augmentation/data_sampling).",
-        "Require that structural pivots preserve proven helpful data-aware settings unless a conflict is justified.",
-        "Reject large from-scratch model-build plans unless explicitly requested by user.",
-        "Do not propose forbidden approaches: nnU-Net / nnUNet / nnUNetv2.",
-    ]
+    if mentor_health_helper_mode:
+        rules = [
+            "Advisory role only: no execution ownership.",
+            "Start critique with a trajectory verdict: 'Trajectory: on_track' or 'Trajectory: off_track'.",
+            "Default to continue; challenge only for clear safety, constraint, or logic violations.",
+            "Keep review concise with at most one critical question.",
+            "Do not add TODO updates in this mode.",
+            "Do not propose forbidden approaches (nnU-Net/nnUNet/nnUNetv2) or test-split tuning.",
+        ]
+    else:
+        rules = [
+            "Advisory role only: critique and strategic challenge, no execution ownership.",
+            "Start critique with a trajectory verdict: 'Trajectory: on_track' or 'Trajectory: off_track'.",
+            "Explicitly judge whether current direction remains strong or alternatives should be explored next.",
+            "Challenge suggestions may target these knobs: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.",
+            "If sound, return continue + null suggestion; if weak/repetitive, return challenge + full suggested_decision.",
+            "Keep review lean: at most one critical question and one high-impact TODO on challenge.",
+            "Do not propose forbidden approaches (nnU-Net/nnUNet/nnUNetv2) or test-split tuning.",
+        ]
     if finishup_active:
         rules.extend(
             [
-                "Finish-up mode is active: critique must be deadline-aware and action-oriented.",
-                "Challenge any plan that wastes remaining time on broad exploration loops.",
-                "Ensure one last high-value training/fine-tune attempt is chosen when remaining_final_training_rounds > 0 and feasible.",
-                "After last training attempt, require report generation with leaderboard and concise final narrative.",
+                "Finish-up mode: keep critique deadline-aware and force completion-oriented decisions and reporting.",
             ]
         )
     if require_web_search:
-        rules.append("Before final recommendation, run at least one web search and use it to validate or challenge the plan.")
+        rules.insert(
+            3,
+            "When web search is enabled, use at least one search-backed signal to validate or challenge direction.",
+        )
+    rules = dedupe_and_limit_rules(rules, MENTOR_RULE_BUDGET)
 
     prompt = {
         "role": "Critical mentor for autonomous CNN experimentation loop",
@@ -1116,10 +1277,14 @@ def build_mentor_prompt(
         "review_contract": {
             "recommendation": "continue or challenge",
             "critique": "short practical critique; include what is risky or missing",
-            "questions": "up to 3 critical questions",
+            "questions": "0-1 critical question",
             "mentor_notes": "short note for mentor_notes.md (advisory only)",
-            "todo_updates": "0-6 concrete TODO items for shared_todo.md",
-            "suggested_decision": "null when continue; full decision object when challenge",
+            "todo_updates": (
+                "empty array in builder_health_helper mode; otherwise 0-1 concrete TODO item for shared_todo.md"
+            ),
+            "suggested_decision": (
+                "always null in builder_health_helper mode unless challenge is safety-critical; otherwise null on continue, full decision on challenge"
+            ),
         },
         "primary_decision": primary_decision,
         "runtime_context": review_context,
@@ -1353,7 +1518,6 @@ def collect_context(
     *,
     workspace_root: pathlib.Path,
     state: dict[str, Any],
-    data_source_root: str,
     worker_mission_path: pathlib.Path,
     mentor_mission_path: pathlib.Path,
     finishup_control_path: pathlib.Path,
@@ -1366,10 +1530,8 @@ def collect_context(
     artifacts_dir = loop_dir / "artifacts"
     events_path = logs_dir / "events.jsonl"
     summaries_path = logs_dir / "cycle_summaries.jsonl"
-    model_selection_marker = artifacts_dir / "MODEL_SELECTION_DONE.md"
     workpad_path = ensure_workpad_file(loop_dir)
     mentor_notes_path, shared_todo_path = ensure_coordination_files(loop_dir)
-    storyline_path = artifacts_dir / "storyline.md"
     finishup_context = collect_finishup_context(
         workspace_root=workspace_root,
         state=state,
@@ -1382,21 +1544,10 @@ def collect_context(
     unresolved_shared_todo_count = count_unresolved_shared_todos(shared_todo_path)
     shared_todo_focus = summarize_recent_open_shared_todos(
         shared_todo_path,
-        max_items=10,
-        max_chars=4000,
+        max_items=8,
+        max_chars=2000,
     )
     last_completed = state.get("last_completed_run")
-    last_run_failed = last_completed_run_failed(last_completed)
-    latest_logs: list[dict[str, Any]] = []
-    if last_run_failed:
-        for p in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)[:4]:
-            latest_logs.append(
-                {
-                    "name": p.name,
-                    "size_bytes": p.stat().st_size,
-                    "tail": tail_text(p, max_bytes=10000)[-3000:],
-                }
-            )
 
     active = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
     active_live = False
@@ -1443,7 +1594,6 @@ def collect_context(
                 questions = [str(x).strip() for x in q if str(x).strip()][:3]
                 if questions:
                     last_mentor_questions = questions
-    distinct_recent_categories = len({c for c in recent_categories if c})
     repeated_category_streak = 0
     if recent_categories:
         last_cat = recent_categories[-1]
@@ -1463,8 +1613,6 @@ def collect_context(
         if d > 0:
             break
         non_improving_streak += 1
-    diversify_hint = repeated_category_streak >= 3 or non_improving_streak >= 3
-
     cycles_with_summaries = len(long_summaries)
     best_val_dice_overall: float | None = None
     best_cycle_overall: int | None = None
@@ -1522,9 +1670,6 @@ def collect_context(
         if isinstance(c, dict) and bool(c.get("used_web_search", False)):
             recent_web_search_count += 1
     online_research_needed = cycles_with_summaries >= 3 and recent_web_search_count == 0
-    orientation_phase_limit = 2
-    orientation_phase_over = cycles_with_summaries > orientation_phase_limit
-
     recent_training_window = recent_training_flags[-8:] if recent_training_flags else []
     consecutive_training_runs = 0
     for tf in reversed(recent_training_window):
@@ -1581,62 +1726,23 @@ def collect_context(
         + 0.05 * float(mentor_challenge_streak)
     )
     breakout_needed = bool(breakout_priority >= 0.70)
-    include_storyline_tail = bool(
-        last_run_failed
-        or mentor_search_requirement_unmet
-        or non_improving_streak >= 4
-        or repeated_category_streak >= 4
-    )
-
     return {
         "time_utc": utc_now(),
-        "workspace_root": str(workspace_root),
-        "data_source_root": data_source_root,
         "active_run": active,
-        "active_run_live": active_live,
         "last_completed_run": last_completed,
-        "recent_events_tail": tail_text(events_path, max_bytes=14000)[-5000:],
-        "recent_logs": latest_logs,
-        "failure_context_active": last_run_failed,
+        "recent_events_tail": tail_text(events_path, max_bytes=8000)[-2000:],
         "mission_file": str(worker_mission_path),
-        "mission_text": read_text_head(worker_mission_path, max_chars=12000),
+        "mission_text": read_text_head(worker_mission_path, max_chars=4000),
         "mentor_mission_file": str(mentor_mission_path),
-        "mentor_mission_text": read_text_head(mentor_mission_path, max_chars=12000),
-        "workpad_file": str(workpad_path),
-        "workpad_text": read_text_tail(workpad_path, max_chars=20000),
-        "mentor_notes_file": str(mentor_notes_path),
-        "mentor_notes_tail": read_text_tail(mentor_notes_path, max_chars=12000),
-        "shared_todo_file": str(shared_todo_path),
+        "mentor_mission_text": read_text_head(mentor_mission_path, max_chars=4000),
+        "workpad_text": read_text_tail(workpad_path, max_chars=6000),
+        "mentor_notes_tail": read_text_tail(mentor_notes_path, max_chars=3000),
         "shared_todo_tail": shared_todo_focus,
-        "storyline_file": str(storyline_path),
-        "storyline_tail": (read_text_tail(storyline_path, max_chars=9000) if include_storyline_tail else ""),
-        "architecture_probe": {
-            "optional": True,
-            "marker_file": str(model_selection_marker),
-            "marker_exists": model_selection_marker.exists(),
-            "candidates_hint": [
-                "simple_unet",
-                "deeplabv3_resnet50",
-                "unet_resnet34",
-            ],
-        },
         "exploration_context": {
             "recent_idea_categories": recent_categories[-8:],
-            "distinct_recent_categories": distinct_recent_categories,
             "repeated_category_streak": repeated_category_streak,
             "non_improving_streak": non_improving_streak,
-            "diversify_hint": diversify_hint,
-            "recent_data_centric_count_8": recent_data_centric_count,
             "data_centric_gap": data_centric_gap,
-            "target_categories": [
-                "preprocessing",
-                "augmentation",
-                "data_sampling",
-                "loss",
-                "model_arch",
-                "optimization",
-                "evaluation",
-            ],
         },
         "performance_context": {
             "cycles_with_summaries": cycles_with_summaries,
@@ -1646,9 +1752,6 @@ def collect_context(
             "best_cycle_overall": best_cycle_overall,
             "best_run_label_overall": best_run_label_overall,
             "cycles_since_best": cycles_since_best,
-            "orientation_phase_limit_cycles": orientation_phase_limit,
-            "orientation_phase_over": orientation_phase_over,
-            "recent_web_search_count_8": recent_web_search_count,
             "online_research_needed": online_research_needed,
         },
         "breakout_context": {
@@ -1656,19 +1759,9 @@ def collect_context(
             "breakout_priority": breakout_priority,
             "non_improving_streak": non_improving_streak,
             "micro_tuning_drift": micro_tuning_drift,
-            "recent_micro_tune_count": micro_tune_count,
-            "recent_structural_count": structural_count,
             "dominant_model_hint": dominant_model,
-            "dominant_model_ratio": dominant_model_ratio,
-            "suggested_structural_moves": [
-                "larger supported backbone or architecture variant",
-                "explicit head/decoder modification",
-                "training budget increase (epochs/max_train_batches/max_eval_batches)",
-                "data-centric preprocessing/augmentation redesign",
-            ],
         },
         "exploration_cadence_context": {
-            "recent_training_runs_8": int(sum(1 for x in recent_training_window if x)),
             "consecutive_training_runs": consecutive_training_runs,
             "cycles_since_last_web_search": cycles_since_last_web_search,
             "cycles_since_last_run_command": cycles_since_last_run_command,
@@ -1676,12 +1769,6 @@ def collect_context(
             "non_training_cycle_due": non_training_cycle_due,
             "research_priority": research_priority,
             "non_training_priority": non_training_priority,
-            "todo_pressure": unresolved_todo_pressure,
-            "recommended_non_training_actions": [
-                "deeper dataset quality/split analysis and update workpad Data Exploration section",
-                "online literature/pattern scan summarized in workpad Notes with explicit takeaways",
-                "error analysis on recent outputs to identify dominant failure mode",
-            ],
         },
         "mentor_context": {
             "recent_recommendations": recent_mentor_recommendations[-6:],
@@ -1692,9 +1779,6 @@ def collect_context(
             "unresolved_shared_todo_count": unresolved_shared_todo_count,
         },
         "coordination_context": {
-            "worker_owned_workpad": str(workpad_path),
-            "mentor_owned_notes": str(mentor_notes_path),
-            "shared_todo": str(shared_todo_path),
             "unresolved_shared_todo_count": unresolved_shared_todo_count,
         },
         "finishup_context": finishup_context,
@@ -2573,7 +2657,6 @@ def write_storyline(
     cycle_index: int,
     cycle_result: dict[str, Any],
     run_label: str,
-    monitor_seconds: int,
     previous_last_completed: Any,
     state: dict[str, Any],
     codex_telemetry: dict[str, Any],
@@ -2585,31 +2668,18 @@ def write_storyline(
         state=state,
     )
     current_best = evidence["current_best"] if isinstance(evidence["current_best"], dict) else None
-    current_latest = evidence["current_latest"] if isinstance(evidence["current_latest"], dict) else None
     delta = safe_float(evidence.get("delta_best_dice"))
     run_outcome = evidence["run_outcome"] if isinstance(evidence["run_outcome"], dict) else {}
 
     rationale = str(cycle_result.get("rationale", "")).strip()
     if len(rationale) > 300:
         rationale = rationale[:297] + "..."
-    command_preview = str(cycle_result.get("command_preview", "")).strip()
-    if len(command_preview) > 220:
-        command_preview = command_preview[:217] + "..."
-
-    parsed_events = int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0
     used_web_search = bool(codex_telemetry.get("used_web_search", False)) if isinstance(codex_telemetry, dict) else False
-    tool_signals = codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else []
-    if not isinstance(tool_signals, list):
-        tool_signals = []
-    tool_short = ", ".join(str(x) for x in tool_signals[:5]) if tool_signals else "none"
     mentor_info = {}
-    worker_hk_info = {}
     quality_gate_info = {}
     codex_info = cycle_result.get("codex")
     if isinstance(codex_info, dict) and isinstance(codex_info.get("mentor"), dict):
         mentor_info = codex_info.get("mentor") or {}
-    if isinstance(codex_info, dict) and isinstance(codex_info.get("worker_housekeeping"), dict):
-        worker_hk_info = codex_info.get("worker_housekeeping") or {}
     if isinstance(cycle_result.get("quality_gate"), dict):
         quality_gate_info = cycle_result.get("quality_gate") or {}
 
@@ -2619,67 +2689,24 @@ def write_storyline(
         if "exit_code" in run_outcome:
             outcome_txt += f" (exit={run_outcome.get('exit_code')})"
     delta_txt = f"{delta:+.3f}" if delta is not None else "n/a"
-    next_txt = "continue rechallenge loop" if str(cycle_result.get("result", "")) == "run_command" else "await next signal"
-    mentor_label = str((mentor_info or {}).get("display_name", "")).strip() or "AI-Mentor"
-    worker_label = str((worker_hk_info or {}).get("display_name", "")).strip() or "AI-Builder"
-    mentor_txt = f"{mentor_label}=skipped"
+    mentor_rec = "n/a"
     if mentor_info:
-        mentor_txt = (
-            f"{mentor_label}="
-            + ("run" if bool(mentor_info.get("run", False)) else "not_due")
-            + ", rec="
-            + (str(mentor_info.get("recommendation", "")).strip() or "n/a")
-            + ", applied="
-            + str(bool(mentor_info.get("applied", False))).lower()
-            + ", search_ok="
-            + str(bool(mentor_info.get("search_requirement_met", True))).lower()
-            + ", todo_added="
-            + str(int(mentor_info.get("shared_todo_added", 0) or 0))
-            + ", todo_open="
-            + str(int(mentor_info.get("shared_todo_unresolved", 0) or 0))
-        )
-    worker_hk_txt = "todo_added=0, notes=0, data=0, resolved=0, shared_open=0"
-    if worker_hk_info:
-        worker_hk_txt = (
-            "todo_added="
-            + str(int(worker_hk_info.get("todo_added", 0) or 0))
-            + ", notes="
-            + str(int(worker_hk_info.get("notes_added", 0) or 0))
-            + ", data="
-            + str(int(worker_hk_info.get("data_exploration_added", 0) or 0))
-            + ", resolved="
-            + str(int(worker_hk_info.get("shared_todo_resolved", 0) or 0))
-            + ", shared_open="
-            + str(int(worker_hk_info.get("shared_todo_unresolved", 0) or 0))
-        )
-    quality_gate_txt = "source=primary, blocked=false, issues=none"
-    if quality_gate_info:
-        issues = quality_gate_info.get("issues", [])
-        if not isinstance(issues, list):
-            issues = []
-        issue_txt = ", ".join(str(x) for x in issues[:4]) if issues else "none"
-        quality_gate_txt = (
-            "source="
-            + str(quality_gate_info.get("source", "primary"))
-            + ", blocked="
-            + str(bool(quality_gate_info.get("blocked", False))).lower()
-            + ", issues="
-            + issue_txt
-        )
-
-    lines = [
-        f"## Cycle {cycle_index:04d} | {now_utc}",
-        f"1. Situation: trace_id={str(cycle_result.get('cycle_trace_id', '') or 'n/a')}, active_run={str(state.get('active_run') is not None).lower()}, last_result={cycle_result.get('result', 'n/a')}",
-        f"2. Decision: action={cycle_result.get('action', 'n/a')}, category={cycle_result.get('idea_category', 'n/a')}, run_label={run_label}, why={rationale or 'n/a'}",
-        f"3. Quality gate: {quality_gate_txt}",
-        f"4. Execution: outcome={outcome_txt}, monitor_seconds={monitor_seconds}, command={command_preview or 'n/a'}",
-        f"5. Data evidence: rows_parsed={evidence.get('current_rows_count', 0)}, best={metric_short(current_best)}, latest={metric_short(current_latest)}, delta_vs_prev={delta_txt}",
-        f"6. LLM evidence: parsed_events={parsed_events}, used_web_search={str(used_web_search).lower()}, tools={tool_short}",
-        f"7. {mentor_label}: {mentor_txt}",
-        f"8. {worker_label} housekeeping: {worker_hk_txt}",
-        f"9. Next checkpoint: {next_txt}",
-        "",
-    ]
+        mentor_rec = str(mentor_info.get("recommendation", "")).strip() or "n/a"
+    quality_blocked = bool(quality_gate_info.get("blocked", False)) if isinstance(quality_gate_info, dict) else False
+    decision_line = (
+        f"- trace={str(cycle_result.get('cycle_trace_id', '') or 'n/a')} "
+        f"| action={cycle_result.get('action', 'n/a')} "
+        f"| category={cycle_result.get('idea_category', 'n/a')} "
+        f"| run={run_label} "
+        f"| outcome={outcome_txt} "
+        f"| best={metric_short(current_best)} "
+        f"| delta={delta_txt} "
+        f"| mentor={mentor_rec} "
+        f"| web={str(used_web_search).lower()} "
+        f"| qgate_blocked={str(quality_blocked).lower()} "
+        f"| why={rationale or 'n/a'}"
+    )
+    lines = [f"## Cycle {cycle_index:04d} | {now_utc}", decision_line, ""]
 
     artifacts_dir = workspace_root / ".llm_loop" / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -2736,7 +2763,7 @@ def main() -> None:
     default_monitor_seconds = int(cfg.get("default_monitor_seconds", 300))
     max_monitor_seconds = int(cfg.get("max_monitor_seconds", 1800))
     rechallenge_on_done = bool(cfg.get("rechallenge_on_done", True))
-    data_source_root = str(cfg.get("data_source_root", ""))
+    interaction_mode = normalize_interaction_mode(cfg.get("interaction_mode", INTERACTION_MODE_STANDARD))
     mission_file = str(cfg.get("mission_file", "AGENTS.md")).strip() or "AGENTS.md"
     worker_mission_file = str(cfg.get("worker_mission_file", mission_file)).strip() or mission_file
     mentor_mission_file = str(cfg.get("mentor_mission_file", mission_file)).strip() or mission_file
@@ -2803,6 +2830,14 @@ def main() -> None:
     except Exception:
         mentor_every_n_cycles = 2
     mentor_every_n_cycles = max(1, mentor_every_n_cycles)
+    if interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER:
+        try:
+            mentor_health_every = int(cfg.get("mentor_health_check_every_n_cycles", 10))
+        except Exception:
+            mentor_health_every = 10
+        mentor_every_n_cycles = max(1, mentor_health_every)
+        mentor_force_when_stuck = False
+        mentor_apply_suggestions = False
     worker_mission_path = pathlib.Path(worker_mission_file)
     if not worker_mission_path.is_absolute():
         worker_mission_path = workspace_root / worker_mission_path
@@ -2826,7 +2861,6 @@ def main() -> None:
     context = collect_context(
         workspace_root=workspace_root,
         state=state,
-        data_source_root=data_source_root,
         worker_mission_path=worker_mission_path,
         mentor_mission_path=mentor_mission_path,
         finishup_control_path=finishup_control_path,
@@ -2834,6 +2868,9 @@ def main() -> None:
         finishup_default_minutes_left=finishup_default_minutes_left,
         finishup_default_report_top_k=finishup_default_report_top_k,
     )
+    context["interaction_mode"] = interaction_mode
+    context["mentor_every_n_cycles"] = mentor_every_n_cycles
+    context["mentor_health_helper_mode"] = interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER
     cycle_index = count_jsonl_rows(events_file) + 1
     cycle_trace_id = f"C{cycle_index:04d}-{uuid.uuid4().hex[:8]}"
     mentor_due, mentor_reasons = should_run_mentor(
@@ -2925,11 +2962,13 @@ def main() -> None:
             mentor_critique = str(mentor_review.get("critique", "")).strip()
             q_raw = mentor_review.get("questions", [])
             if isinstance(q_raw, list):
-                mentor_questions = [str(x).strip() for x in q_raw if str(x).strip()][:3]
+                mentor_questions = [str(x).strip() for x in q_raw if str(x).strip()][:1]
             mentor_notes_txt = str(mentor_review.get("mentor_notes", "")).strip()
             todo_raw = mentor_review.get("todo_updates", [])
             if isinstance(todo_raw, list):
-                mentor_todo_updates = [str(x).strip() for x in todo_raw if str(x).strip()][:6]
+                mentor_todo_updates = [str(x).strip() for x in todo_raw if str(x).strip()][:1]
+            if interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER:
+                mentor_todo_updates = []
             if mentor_require_web_search and mentor_network_access_enabled:
                 mentor_search_requirement_met = bool(mentor_telemetry.get("used_web_search", False))
             if mentor_apply_suggestions and mentor_search_requirement_met and mentor_recommendation == "challenge":
@@ -3013,12 +3052,18 @@ def main() -> None:
             "issues": effective_quality_issues[:8],
         },
         "codex": {
+            "interaction_mode": interaction_mode,
             "used_web_search": bool(codex_telemetry.get("used_web_search", False)),
             "parsed_event_lines": int(codex_telemetry.get("parsed_event_lines", 0)) if isinstance(codex_telemetry, dict) else 0,
             "trace_file": str(codex_telemetry.get("trace_file", "")) if isinstance(codex_telemetry, dict) else "",
             "tool_signals": codex_telemetry.get("tool_signals", []) if isinstance(codex_telemetry, dict) else [],
             "mentor": {
                 "display_name": mentor_display_name,
+                "role_mode": (
+                    "health_helper"
+                    if interaction_mode == INTERACTION_MODE_BUILDER_HEALTH_HELPER
+                    else "challenge_reviewer"
+                ),
                 "enabled": mentor_enabled,
                 "run": mentor_due,
                 "reasons": mentor_reasons,
@@ -3228,7 +3273,6 @@ def main() -> None:
             cycle_index=cycle_index,
             cycle_result=cycle_result,
             run_label=final_record_run_label,
-            monitor_seconds=monitor_seconds,
             previous_last_completed=previous_last_completed,
             state=state,
             codex_telemetry=codex_telemetry if isinstance(codex_telemetry, dict) else {},

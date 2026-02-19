@@ -1,6 +1,7 @@
 # llm_driven_cnns
 
 Cleanroom wrapper for Codex-driven CNN experimentation.
+This loop is used in a competitive challenge setting, with focus on high-quality validation gains and reproducibility.
 
 ## Quick Start
 ```powershell
@@ -63,6 +64,12 @@ Loop mission is now role-separated:
 - Worker mission: `WORKER_MISSION.md`
 - Mentor mission: `MENTOR_MISSION.md`
 - Display names (ops/UI): `AI-Builder` (worker) and `AI-Mentor` (mentor).
+- Shared tuning knobs (both roles): `augmentation`, `preprocessing`, `data_sampling`, `loss`, `model_arch`, `optimization`, `evaluation`.
+
+Current interaction profile:
+- `interaction_mode=standard` (in `config/daemon_config.json`)
+- Builder and Mentor both participate in autonomous learning (execution owner + strategic challenger).
+- Interaction is tuned for low overhead: concise challenges, sparse TODOs, and execution-first follow-through.
 
 Cadence policy:
 - Adaptive and evidence-driven, not fixed cycle quotas.
@@ -72,6 +79,7 @@ Cadence policy:
 Configured in `config/daemon_config.json`:
 - `worker_mission_file`
 - `mentor_mission_file`
+- `interaction_mode` (`standard` or `builder_health_helper`)
 
 Fallback:
 - `mission_file` remains supported and is used when role-specific files are not set.
@@ -86,17 +94,20 @@ Interaction model (SOTA-inspired):
 
 ## Worker Housekeeping (Per Cycle)
 Worker decision output includes required housekeeping fields. Wrapper writes these into artifacts:
-- `todo_new` -> `.llm_loop/artifacts/shared_todo.md` (single shared TODO queue)
+- `todo_new` -> `.llm_loop/artifacts/shared_todo.md` (single shared TODO queue, capped to 0-2)
 - `notes_update` -> `.llm_loop/artifacts/workpad.md` (`## Notes`)
 - `data_exploration_update` -> `.llm_loop/artifacts/workpad.md` (`## Data Exploration`)
 - `resolve_shared_todo_ids` -> marks matching IDs in `.llm_loop/artifacts/shared_todo.md` as resolved
+- mentor TODO writes are constrained: challenge-oriented and capped to 0-1 per cycle
 
 Context ingestion behavior:
 - Worker/mentor prompts read latest tails of `workpad.md` and `mentor_notes.md` (not file heads).
-- `shared_todo.md` is ingested as a compact recent-open summary (not full tail) to reduce context bloat.
+- `shared_todo.md` is ingested as a compact focus summary (oldest unresolved + newest unresolved, deduped) to reduce context bloat while keeping long-lived priorities visible.
 - `storyline.md` is treated as backup context and is included only when failure/stall signals are high.
 - Recent `.log` tails are injected only when the latest completed run failed.
 - Unresolved shared TODO count is computed from the full `shared_todo.md` file.
+- New TODO writes are backlog-aware and duplicate-aware (caps tighten when open backlog grows).
+- Runtime prompt context is intentionally compact (high-level signals over long heuristic payloads).
 
 ## Lightweight Quality Gate
 Before execution, wrapper applies a simple decision-quality checklist.
@@ -104,7 +115,7 @@ If violated, the cycle is auto-downgraded to `wait` and reasons are logged.
 
 Current gate checks:
 - rationale should be non-trivial (not very short)
-- housekeeping cannot be fully empty on routine worker cycles (`run_command`/`wait`)
+- housekeeping quality is tracked, but empty housekeeping no longer blocks execution
 - `run_command` must include non-empty command, non-generic run label, and explicit repo context (`Set-Location`/`cd`)
 
 Quality gate telemetry appears in cycle events under `quality_gate` and storyline entries.
@@ -232,8 +243,10 @@ Notes:
   - `.llm_loop/artifacts/mentor_notes.md` (mentor-owned, wrapper-written from mentor output)
   - `.llm_loop/artifacts/shared_todo.md` (single shared queue; worker + mentor append via wrapper)
 - Config keys in `config/daemon_config.json`:
+  - `interaction_mode`
   - `mentor_enabled`
   - `mentor_every_n_cycles`
+  - `mentor_health_check_every_n_cycles` (used by `builder_health_helper` mode)
   - `mentor_force_when_stuck`
   - `mentor_challenge_streak_min_idle_cycles` (prevents stuck-trigger mentor forcing while worker is already executing)
   - `mentor_apply_suggestions`
@@ -242,3 +255,12 @@ Notes:
   - `mentor_model`, `mentor_reasoning_effort`, `mentor_web_search_mode`
 - Mentor telemetry and critique are written into each cycle event under `codex.mentor`.
 - Mentor is expected to propose concrete model-architecture alternatives when stagnation persists, but not on every cycle by default.
+
+Standard dual-agent behavior (current default):
+- Mentor cadence defaults to every 4 cycles (plus stuck-condition checks).
+- Mentor can challenge with a concrete replacement decision, but challenge loops are discouraged unless there is new evidence.
+- Worker should respond by action and evaluation, not extended back-and-forth discussion.
+- Mentor TODO writes are capped to at most one item on challenge, zero on continue.
+- Mentor review is lean-scripted: explicit trajectory verdict (`on_track`/`off_track`) and at most one critical question.
+- Prompt rule budget is hard-capped to stay lean: worker <=12, mentor <=8 (current standard profile: 9 + 6 = 15).
+- Storyline is lean: one main decision line per cycle for quick scanability.
