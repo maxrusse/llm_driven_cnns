@@ -792,7 +792,14 @@ def append_mentor_coordination_artifacts(
 
 
 def run_cmd(args: list[str], cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def count_jsonl_rows(path: pathlib.Path) -> int:
@@ -1613,6 +1620,8 @@ def call_codex(
             cwd=str(workspace_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env={**os.environ, "CODEX_HOME": str(codex_home)},
         )
 
