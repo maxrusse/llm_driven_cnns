@@ -250,6 +250,8 @@ Notes:
   - `mentor_force_when_stuck`
   - `mentor_challenge_streak_min_idle_cycles` (prevents stuck-trigger mentor forcing while worker is already executing)
   - `mentor_apply_suggestions`
+  - `enable_stuck_wait_recovery` (defaults to `false`; prevents forced relaunches during long wait-only windows)
+  - `stale_orphan_idle_cycles`, `stuck_wait_recovery_cycles`
   - `worker_display_name`, `mentor_display_name`
   - `mentor_require_web_search`
   - `mentor_model`, `mentor_reasoning_effort`, `mentor_web_search_mode`

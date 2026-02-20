@@ -64,6 +64,7 @@ WORKER_RULE_BUDGET = 12
 MENTOR_RULE_BUDGET = 8
 DEFAULT_STALE_ORPHAN_IDLE_CYCLES = 3
 DEFAULT_STUCK_WAIT_RECOVERY_CYCLES = 8
+DEFAULT_ENABLE_STUCK_WAIT_RECOVERY = False
 
 
 def utc_now() -> str:
@@ -978,10 +979,14 @@ def _append_output_dir_suffix(command: str, suffix: str) -> str:
         prefix = m.group(1)
         quote = m.group(2)
         raw_val = m.group(3)
-        if raw_val.endswith(suffix):
-            new_val = raw_val
+        base_val = re.sub(r"(?:_recovery_c\d{4}|_rc\d{4})+$", "", raw_val, flags=re.IGNORECASE)
+        if base_val.endswith(suffix):
+            new_val = base_val
         else:
-            new_val = raw_val + suffix
+            new_val = base_val + suffix
+        # Keep generated output-dir short enough for Windows path limits.
+        if len(new_val) > 120:
+            new_val = f"runs\\orphan_recovery{suffix}"
         return f"{prefix}{quote}{new_val}{quote}"
 
     updated, n = patt.subn(repl, cmd, count=1)
@@ -996,23 +1001,72 @@ def choose_wait_recovery_launch(
     bootstrap_command: str,
     cycle_index: int,
 ) -> tuple[str, str, str]:
-    suffix = f"_recovery_c{cycle_index:04d}"
+    suffix = f"_rc{cycle_index:04d}"
+
+    def normalize_recovery_label(raw_label: str) -> str:
+        base = re.sub(r"(?:_recovery(?:_c\d{4})?|_rc\d{4})+$", "", str(raw_label or "").strip(), flags=re.IGNORECASE)
+        if not base:
+            base = "orphan_run"
+        safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in base.lower())
+        safe = re.sub(r"_+", "_", safe).strip("_-") or "orphan_run"
+        safe = safe[:48].rstrip("_-") or "orphan_run"
+        return f"{safe}{suffix}"
+
     if isinstance(orphan_watch, dict):
         base_cmd = str(orphan_watch.get("command", "")).strip()
         if base_cmd:
-            run_label = str(orphan_watch.get("run_label", "")).strip() or "orphan_run"
+            run_label = normalize_recovery_label(str(orphan_watch.get("run_label", "")).strip())
             return (
                 _append_output_dir_suffix(base_cmd, suffix),
-                f"{run_label}_recovery".strip("_"),
+                run_label,
                 "orphan_replay",
             )
     if str(bootstrap_command or "").strip():
         return (
             _append_output_dir_suffix(str(bootstrap_command).strip(), suffix),
-            f"recovery_bootstrap_c{cycle_index:04d}",
+            f"recovery_bootstrap{suffix}",
             "bootstrap_fallback",
         )
     return "", "", "none"
+
+
+def ensure_finishup_report_command_args(
+    command: str,
+    *,
+    workspace_root: pathlib.Path,
+    finishup_context: dict[str, Any] | None,
+) -> tuple[str, bool]:
+    cmd = str(command or "").strip()
+    if not cmd:
+        return "", False
+    if "generate_finishup_report.py" not in cmd.lower():
+        return cmd, False
+    if re.search(r"--workspace-root\b", cmd, flags=re.IGNORECASE):
+        return cmd, False
+
+    ctx = finishup_context if isinstance(finishup_context, dict) else {}
+    outputs = ctx.get("report_outputs", {}) if isinstance(ctx.get("report_outputs"), dict) else {}
+    top_k = 10
+    try:
+        top_k = max(3, min(20, int(ctx.get("report_top_k", 10))))
+    except Exception:
+        top_k = 10
+
+    repo_root = workspace_root.parent / "xray_fracture_benchmark"
+    condensed = str(outputs.get("condensed_story_md") or (workspace_root / ".llm_loop" / "artifacts" / "final_condensed_story.md"))
+    paper = str(outputs.get("paper_report_md") or (workspace_root / ".llm_loop" / "artifacts" / "final_paper_report.md"))
+    leaderboard_json = str(outputs.get("leaderboard_json") or (workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.json"))
+    leaderboard_md = str(outputs.get("leaderboard_md") or (workspace_root / ".llm_loop" / "artifacts" / f"final_leaderboard_top{top_k}.md"))
+    extras = (
+        f"--workspace-root '{workspace_root}' "
+        + f"--repo-root '{repo_root}' "
+        + f"--top-k {top_k} "
+        + f"--condensed-story-out '{condensed}' "
+        + f"--paper-report-out '{paper}' "
+        + f"--leaderboard-json-out '{leaderboard_json}' "
+        + f"--leaderboard-md-out '{leaderboard_md}'"
+    )
+    return (cmd + " " + extras).strip(), True
 
 
 def is_pid_running(pid: int) -> bool:
@@ -1271,7 +1325,7 @@ def build_prompt(
         "If orphan_watch is stale and no active_run exists, avoid repeated wait loops; recover with run_command.",
         "Keep housekeeping minimal and execution-first; resolve existing shared_todo IDs before adding new ones.",
         "Use evidence-driven category diversity; avoid repeated micro-tuning without meaningful changes.",
-        "Allowed tuning knobs: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.",
+        "Allowed optimization dimensions: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.",
         "Convert evidence (data + research) into concrete experiments; adapt patterns, do not copy turnkey pipelines.",
     ]
     if mentor_health_helper_mode:
@@ -2971,6 +3025,7 @@ def main() -> None:
     except Exception:
         stuck_wait_recovery_cycles = DEFAULT_STUCK_WAIT_RECOVERY_CYCLES
     stuck_wait_recovery_cycles = max(2, stuck_wait_recovery_cycles)
+    enable_stuck_wait_recovery = bool(cfg.get("enable_stuck_wait_recovery", DEFAULT_ENABLE_STUCK_WAIT_RECOVERY))
     worker_display_name = str(cfg.get("worker_display_name", "AI-Builder")).strip() or "AI-Builder"
     mentor_display_name = str(cfg.get("mentor_display_name", "AI-Mentor")).strip() or "AI-Mentor"
     auto_repair_enabled = bool(cfg.get("auto_repair_enabled", True))
@@ -3091,6 +3146,7 @@ def main() -> None:
     context["force_bootstrap_if_idle"] = force_bootstrap_if_idle
     context["stale_orphan_idle_cycles"] = stale_orphan_idle_cycles
     context["stuck_wait_recovery_cycles"] = stuck_wait_recovery_cycles
+    context["enable_stuck_wait_recovery"] = enable_stuck_wait_recovery
     context["orphan_watch"] = orphan_watch if isinstance(orphan_watch, dict) else {}
     context["orphan_recovery_due"] = bool(
         isinstance(orphan_watch, dict) and bool(orphan_watch.get("stale", False))
@@ -3250,6 +3306,7 @@ def main() -> None:
         "ts_utc": utc_now(),
         "cycle_trace_id": cycle_trace_id,
         "action": action,
+        "run_label": run_label,
         "idea_category": idea_category,
         "rationale": rationale,
         "finishup": context.get("finishup_context") if isinstance(context.get("finishup_context"), dict) else {},
@@ -3328,7 +3385,11 @@ def main() -> None:
     orphan_recovery_due = bool(orphan_watch_state and bool(orphan_watch_state.get("stale", False)))
 
     if action == "wait" and no_active_live:
-        stuck_due_to_wait_cycles = cycles_since_last_run_command_effective >= stuck_wait_recovery_cycles
+        stuck_due_to_wait_cycles = (
+            enable_stuck_wait_recovery
+            and cycles_since_last_run_command_effective >= stuck_wait_recovery_cycles
+            and orphan_watch_state is None
+        )
         if orphan_recovery_due or stuck_due_to_wait_cycles:
             rec_cmd, rec_label, rec_source = choose_wait_recovery_launch(
                 orphan_watch=orphan_watch_state,
@@ -3415,6 +3476,14 @@ def main() -> None:
         if not command:
             cycle_result["result"] = "invalid_empty_command"
         else:
+            command, report_args_injected = ensure_finishup_report_command_args(
+                command,
+                workspace_root=workspace_root,
+                finishup_context=(context.get("finishup_context") if isinstance(context.get("finishup_context"), dict) else None),
+            )
+            if report_args_injected:
+                cycle_result["report_args_injected"] = True
+                cycle_result["command_preview"] = command[:260]
             blocked, blocked_token = detect_forbidden_command_usage(command)
             if blocked:
                 cycle_result["result"] = "blocked_forbidden_approach"
@@ -3511,6 +3580,7 @@ def main() -> None:
     else:
         cycle_result["result"] = "wait"
 
+    cycle_result["run_label"] = final_record_run_label
     try:
         summary_file = write_cycle_summary(
             workspace_root=workspace_root,

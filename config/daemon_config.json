@@ -10,6 +10,7 @@
   "cycle_poll_seconds": 5,
   "default_monitor_seconds": 300,
   "max_monitor_seconds": 1800,
+  "enable_stuck_wait_recovery": false,
   "rechallenge_on_done": true,
   "mentor_enabled": true,
   "mentor_every_n_cycles": 4,
