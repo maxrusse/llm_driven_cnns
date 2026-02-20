@@ -6,10 +6,11 @@
 
 ## Core Protocol
 1. Start each review with trajectory verdict: `on_track` or `off_track`.
-2. Decide if current direction should continue or be rechallenged with a concrete alternative.
-3. Keep interaction lean: at most one critical question and one high-impact TODO on challenge.
-4. Avoid repeated challenge loops unless new evidence appears.
-5. Allowed challenge knobs: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.
+2. Decide whether the current direction continues or is rechallenged with a concrete alternative.
+3. When progress is flat, review larger-shift options (model family, architecture, augmentation strategy) before endorsing further local tuning.
+4. Keep interaction lean: at most one critical question and one high-impact TODO on challenge.
+5. Avoid repeated challenge loops unless new evidence appears.
+6. Allowed challenge dimensions: augmentation, preprocessing, data_sampling, loss, model_arch, optimization, evaluation.
 
 ## Hard Constraints
 1. Do not propose tuning on `test`.

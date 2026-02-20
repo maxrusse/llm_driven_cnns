@@ -64,7 +64,7 @@ Loop mission is now role-separated:
 - Worker mission: `WORKER_MISSION.md`
 - Mentor mission: `MENTOR_MISSION.md`
 - Display names (ops/UI): `AI-Builder` (worker) and `AI-Mentor` (mentor).
-- Shared tuning knobs (both roles): `augmentation`, `preprocessing`, `data_sampling`, `loss`, `model_arch`, `optimization`, `evaluation`.
+- Shared strategy dimensions (both roles): `augmentation`, `preprocessing`, `data_sampling`, `loss`, `model_arch`, `optimization`, `evaluation`.
 
 Current interaction profile:
 - `interaction_mode=standard` (in `config/daemon_config.json`)
@@ -114,7 +114,7 @@ Before execution, wrapper applies a simple decision-quality checklist.
 If violated, the cycle is auto-downgraded to `wait` and reasons are logged.
 
 Current gate checks:
-- rationale should be non-trivial (not very short)
+- rationale must be non-trivial (not very short)
 - housekeeping quality is tracked, but empty housekeeping no longer blocks execution
 - `run_command` must include non-empty command, non-generic run label, and explicit repo context (`Set-Location`/`cd`)
 
@@ -125,7 +125,7 @@ When a run fails, the wrapper can do one automatic recovery pass:
 - Detect known `ModuleNotFoundError` cases from stderr.
 - Install mapped packages into the configured training venv (`auto_repair_python_exe`).
 - If a missing module is not mapped, try a direct package guess (module name / alias mapping).
-- Optionally clone a model source repo and install it into the same training venv.
+- If configured, clone a model source repo and install it into the same training venv.
 - Retry the same command once.
 - If stderr shows `Unsupported model.name` for known aliases (for example `unet_resnet34`), apply a configured fallback model name and retry once.
 - If a model fallback exists, fallback is preferred over blind package install attempts.
@@ -259,7 +259,7 @@ Notes:
 Standard dual-agent behavior (current default):
 - Mentor cadence defaults to every 4 cycles (plus stuck-condition checks).
 - Mentor can challenge with a concrete replacement decision, but challenge loops are discouraged unless there is new evidence.
-- Worker should respond by action and evaluation, not extended back-and-forth discussion.
+- Worker responds by action and evaluation, not extended back-and-forth discussion.
 - Mentor TODO writes are capped to at most one item on challenge, zero on continue.
 - Mentor review is lean-scripted: explicit trajectory verdict (`on_track`/`off_track`) and at most one critical question.
 - Prompt rule budget is hard-capped to stay lean: worker <=12, mentor <=8 (current standard profile: 9 + 6 = 15).
