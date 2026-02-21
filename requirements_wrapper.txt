@@ -1,0 +1,4 @@
+# Wrapper-only environment for llm_driven_cnns_venv.
+# Python scripts in this repo currently use stdlib only.
+# Keep this file intentionally lean to avoid pulling heavy ML deps into
+# the loop-control venv.

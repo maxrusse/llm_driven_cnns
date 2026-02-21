@@ -1,1 +1,3 @@
-# Keep this minimal; wrapper only.
+# Wrapper-only environment for llm_driven_cnns_venv.
+# Keep this file lean; training dependencies live in xray_fracture_benchmark.
+-r requirements_wrapper.txt

@@ -385,14 +385,15 @@ bash ./scripts/bootstrap_venvs.sh --workspace-root /path/to/workspace
 ```
 
 ## Rebuild Requirements
-Full training-stack rebuild file:
+Wrapper/control venv rebuild:
 ```powershell
 cd C:\Users\Max\code\llm_driven_cnns
 python -m pip install -r .\requirements.txt
 ```
 
 Notes:
-- `requirements.txt` includes sibling repo training deps (`..\xray_fracture_benchmark\requirements*.txt`).
+- `requirements.txt` is wrapper-only and resolves to `requirements_wrapper.txt`.
+- Training dependencies stay in `xray_fracture_benchmark` (`requirements.txt`, optional `requirements-cu128.txt`).
 - `scripts\install_tools.ps1` installs only `requirements_wrapper.txt` to keep the loop-control venv lean.
 - `scripts/install_tools.sh` does the same on Linux.
 

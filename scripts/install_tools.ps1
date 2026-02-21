@@ -39,8 +39,8 @@ if (Ensure-Pip -PythonExe $py) {
     Write-Host "Installing Python requirements..."
     & $py -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip in venv." }
-    & $py -m pip install -r (Join-Path $repoRoot "requirements.txt")
-    if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements.txt." }
+    & $py -m pip install -r (Join-Path $repoRoot "requirements_wrapper.txt")
+    if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements_wrapper.txt." }
 } else {
     Write-Warning "pip is unavailable in the venv. Skipping Python package installation."
 }
