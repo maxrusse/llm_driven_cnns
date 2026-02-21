@@ -1,0 +1,96 @@
+{
+  "run_id": "llm_driven_cnns_day01",
+  "model": "gpt-5.3-codex",
+  "reasoning_effort": "high",
+  "web_search_mode": "live",
+  "network_access_enabled": true,
+  "interaction_mode": "standard",
+  "skip_git_repo_check": true,
+  "run_shell": "bash",
+  "daemon_poll_seconds": 20,
+  "cycle_poll_seconds": 5,
+  "default_monitor_seconds": 300,
+  "max_monitor_seconds": 1800,
+  "enable_stuck_wait_recovery": false,
+  "rechallenge_on_done": true,
+  "mentor_enabled": true,
+  "mentor_every_n_cycles": 4,
+  "mentor_health_check_every_n_cycles": 10,
+  "mentor_force_when_stuck": true,
+  "mentor_challenge_streak_min_idle_cycles": 4,
+  "mentor_apply_suggestions": true,
+  "worker_display_name": "AI-Builder",
+  "mentor_display_name": "AI-Mentor",
+  "mentor_require_web_search": false,
+  "mentor_model": "gpt-5.3-codex",
+  "mentor_reasoning_effort": "high",
+  "mentor_web_search_mode": "live",
+  "mentor_network_access_enabled": true,
+  "force_bootstrap_if_idle": true,
+  "bootstrap_label": "xray_fastdev_bootstrap",
+  "bootstrap_command": "cd '../xray_fracture_benchmark' && export PYTHONPATH=\"$PWD\" && ../xray_fracture_benchmark_venv/bin/python scripts/train.py --config configs/fast_dev.yaml --output-dir runs/llm_bootstrap_fastdev",
+  "workspace_root": ".",
+  "mission_file": "AGENTS.md",
+  "worker_mission_file": "WORKER_MISSION.md",
+  "mentor_mission_file": "MENTOR_MISSION.md",
+  "python_exe": "../llm_driven_cnns_venv/bin/python",
+  "auto_repair_enabled": true,
+  "auto_repair_retry_on_success": true,
+  "auto_repair_allow_direct_module_install": true,
+  "auto_repair_python_exe": "../xray_fracture_benchmark_venv/bin/python",
+  "auto_repair_module_package_map": {
+    "segmentation_models_pytorch": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "timm": [
+      "timm"
+    ],
+    "einops": [
+      "einops"
+    ],
+    "transformers": [
+      "transformers"
+    ]
+  },
+  "auto_repair_module_alias_map": {
+    "cv2": [
+      "opencv-python"
+    ],
+    "pil": [
+      "pillow"
+    ],
+    "yaml": [
+      "pyyaml"
+    ],
+    "sklearn": [
+      "scikit-learn"
+    ]
+  },
+  "auto_repair_module_clone_map": {},
+  "auto_repair_model_package_map": {
+    "unet_resnet34": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "unet_resnet34_dual": [
+      "segmentation-models-pytorch",
+      "timm"
+    ],
+    "unet_resnet34_dual_head": [
+      "segmentation-models-pytorch",
+      "timm"
+    ]
+  },
+  "auto_repair_model_clone_map": {},
+  "auto_repair_model_fallback_map": {
+    "unet_resnet34": "simple_unet",
+    "unet_resnet34_dual": "simple_unet_dual_head",
+    "unet_resnet34_dual_head": "simple_unet_dual_head"
+  },
+  "finishup_control_file": ".llm_loop/FINISH_UP.json",
+  "finishup_report_script": "scripts/generate_finishup_report.py",
+  "finishup_default_minutes_left": 60,
+  "finishup_default_report_top_k": 10,
+  "data_source_root": "../xray_fracture_benchmark/data"
+}
