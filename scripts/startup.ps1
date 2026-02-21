@@ -16,6 +16,7 @@ if (-not (Test-Path $cfgAbs)) { throw "Config not found: $cfgAbs" }
 $cfg = Get-Content -Path $cfgAbs -Raw | ConvertFrom-Json
 $workspaceRoot = if ([string]::IsNullOrWhiteSpace([string]$cfg.workspace_root)) { $repoRoot } else { [string]$cfg.workspace_root }
 $dataSourceRoot = [string]$cfg.data_source_root
+$effectiveCfgAbs = $cfgAbs
 
 & (Join-Path $repoRoot "scripts\\link_data.ps1") -WorkspaceRoot $workspaceRoot -DataSourceRoot $dataSourceRoot
 
@@ -36,8 +37,8 @@ if ($RunHours -gt 0) {
 
 $daemonScript = Join-Path $repoRoot "scripts\\start_llm_daemon.ps1"
 if ($StartInNewWindow) {
-    Start-Process -FilePath "pwsh.exe" -WorkingDirectory $repoRoot -ArgumentList @("-NoProfile", "-File", $daemonScript, "-ConfigPath", $cfgAbs) | Out-Null
+    Start-Process -FilePath "pwsh.exe" -WorkingDirectory $repoRoot -ArgumentList @("-NoProfile", "-File", $daemonScript, "-ConfigPath", $effectiveCfgAbs) | Out-Null
     Write-Host "Daemon started in new window."
 } else {
-    & $daemonScript -ConfigPath $cfgAbs
+    & $daemonScript -ConfigPath $effectiveCfgAbs
 }

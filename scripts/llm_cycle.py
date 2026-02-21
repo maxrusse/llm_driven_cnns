@@ -6,6 +6,8 @@ import re
 import json
 import os
 import pathlib
+import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -1048,6 +1050,13 @@ def ensure_finishup_report_command_args(
         return "", False
     if "generate_finishup_report.py" not in cmd.lower():
         return cmd, False
+    # Only patch plain direct report commands. If a command embeds report
+    # invocation in control-flow (if/else/blocks), appending args at tail can
+    # break PowerShell parsing.
+    if re.search(r"\b(if|elseif|else|for|foreach|while|switch|try|catch|finally|exit)\b", cmd, flags=re.IGNORECASE):
+        return cmd, False
+    if "{" in cmd or "}" in cmd:
+        return cmd, False
     if re.search(r"--workspace-root\b", cmd, flags=re.IGNORECASE):
         return cmd, False
 
@@ -1076,21 +1085,79 @@ def ensure_finishup_report_command_args(
     return (cmd + " " + extras).strip(), True
 
 
+def resolve_run_shell_mode(raw_mode: str) -> str:
+    mode = str(raw_mode or "").strip().lower()
+    if mode in {"auto", "bash", "sh", "pwsh", "powershell"}:
+        return mode
+    return "auto"
+
+
+def build_shell_invocation(command: str, run_shell_mode: str) -> list[str]:
+    mode = resolve_run_shell_mode(run_shell_mode)
+    if mode == "auto":
+        mode = "pwsh" if os.name == "nt" else "bash"
+
+    if mode in {"pwsh", "powershell"}:
+        for cand in ("pwsh.exe", "pwsh", "powershell.exe", "powershell"):
+            if shutil.which(cand):
+                return [cand, "-NoProfile", "-Command", command]
+        return ["pwsh", "-NoProfile", "-Command", command]
+
+    if mode == "bash":
+        for cand in ("bash", "/bin/bash"):
+            if shutil.which(cand) or pathlib.Path(cand).exists():
+                return [cand, "-lc", command]
+        for cand in ("sh", "/bin/sh"):
+            if shutil.which(cand) or pathlib.Path(cand).exists():
+                return [cand, "-c", command]
+        return ["bash", "-lc", command]
+
+    for cand in ("sh", "/bin/sh"):
+        if shutil.which(cand) or pathlib.Path(cand).exists():
+            return [cand, "-c", command]
+    return ["sh", "-c", command]
+
+
 def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
-    proc = run_cmd(["cmd.exe", "/c", f"tasklist /FI \"PID eq {pid}\""])
-    if proc.returncode != 0:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    out = (proc.stdout or "").lower()
-    return str(pid) in out and "no tasks are running" not in out
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def kill_pid(pid: int) -> bool:
     if pid <= 0:
         return False
-    proc = run_cmd(["cmd.exe", "/c", f"taskkill /PID {pid} /T /F"])
-    return proc.returncode == 0
+    try:
+        if os.name == "nt":
+            proc = run_cmd(["taskkill", "/PID", str(pid), "/T", "/F"])
+            if proc.returncode == 0:
+                return True
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return True
+            except Exception:
+                return False
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except Exception:
+            os.kill(pid, signal.SIGTERM)
+        time.sleep(0.3)
+        if is_pid_running(pid):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except Exception:
+                os.kill(pid, signal.SIGKILL)
+        return not is_pid_running(pid)
+    except Exception:
+        return False
 
 
 def build_decision_schema() -> dict[str, Any]:
@@ -1587,7 +1654,7 @@ def call_codex(
         cmd = [
             codex_exe,
             "exec",
-            "--experimental-json",
+            "--json",
             "--model",
             model,
             "--sandbox",
@@ -2031,6 +2098,7 @@ def run_new_command(
     workspace_root: pathlib.Path,
     command: str,
     run_label: str,
+    run_shell_mode: str,
     monitor_seconds: int,
     cycle_poll_seconds: int,
     stop_flags: list[pathlib.Path],
@@ -2049,12 +2117,14 @@ def run_new_command(
     stderr_path = logs_dir / f"{run_tag}.stderr.log"
     out_f = stdout_path.open("w", encoding="utf-8", buffering=1)
     err_f = stderr_path.open("w", encoding="utf-8", buffering=1)
+    shell_cmd = build_shell_invocation(command, run_shell_mode)
     proc = subprocess.Popen(
-        ["pwsh.exe", "-NoProfile", "-Command", command],
+        shell_cmd,
         cwd=str(workspace_root),
         stdout=out_f,
         stderr=err_f,
         text=True,
+        start_new_session=(os.name != "nt"),
     )
     state["active_run"] = {
         "pid": proc.pid,
@@ -2196,7 +2266,7 @@ def normalize_clone_map(raw: Any) -> dict[str, dict[str, Any]]:
 def extract_python_exe_from_command(command: str) -> str | None:
     if not command:
         return None
-    for m in re.finditer(r"['\"]([A-Za-z]:[\\/][^'\"]*python(?:\.exe)?)['\"]", command, flags=re.IGNORECASE):
+    for m in re.finditer(r"['\"]([^'\"]*python(?:\d+(?:\.\d+)?)?(?:\.exe)?)['\"]", command, flags=re.IGNORECASE):
         candidate = m.group(1).strip()
         if candidate and pathlib.Path(candidate).exists():
             return candidate
@@ -2871,6 +2941,9 @@ def write_cycle_summary(
     trace_file = str(codex_telemetry.get("trace_file", "n/a")) if isinstance(codex_telemetry, dict) else "n/a"
 
     summaries_log = workspace_root / ".llm_loop" / "logs" / "cycle_summaries.jsonl"
+    is_partial_monitor = str(run_outcome.get("status", "")).strip().lower() == "monitor_window_elapsed"
+    summary_best_dice = None if is_partial_monitor else current_best_dice
+    summary_rows_parsed = 0 if is_partial_monitor else int(evidence.get("current_rows_count", 0))
     append_jsonl(
         summaries_log,
         {
@@ -2880,10 +2953,11 @@ def write_cycle_summary(
             "action": cycle_result.get("action"),
             "result": cycle_result.get("result"),
             "run_label": run_label,
-            "best_val_dice_pos": current_best_dice,
+            "best_val_dice_pos": summary_best_dice,
             "prev_best_val_dice_pos": prev_best_dice,
             "delta_best_val_dice_pos": delta,
-            "rows_parsed": int(evidence.get("current_rows_count", 0)),
+            "rows_parsed": summary_rows_parsed,
+            "metrics_partial": is_partial_monitor,
             "used_web_search": used_web_search,
             "codex_event_counts": event_counts,
             "tool_signals": tool_signals[:12],
@@ -2976,14 +3050,15 @@ def main() -> None:
     config_path = pathlib.Path(args.config_path).resolve()
     codex_exe = str(args.codex_exe).strip()
     codex_home = pathlib.Path(args.codex_home).resolve()
-    if codex_exe.lower().endswith(".ps1"):
-        maybe_cmd = str(pathlib.Path(codex_exe).with_suffix(".cmd"))
-        if pathlib.Path(maybe_cmd).exists():
-            codex_exe = maybe_cmd
-    if codex_exe and not codex_exe.lower().endswith(".cmd"):
-        maybe_cmd = pathlib.Path(codex_exe + ".cmd")
-        if maybe_cmd.exists():
-            codex_exe = str(maybe_cmd)
+    if os.name == "nt":
+        if codex_exe.lower().endswith(".ps1"):
+            maybe_cmd = str(pathlib.Path(codex_exe).with_suffix(".cmd"))
+            if pathlib.Path(maybe_cmd).exists():
+                codex_exe = maybe_cmd
+        if codex_exe and not codex_exe.lower().endswith(".cmd"):
+            maybe_cmd = pathlib.Path(codex_exe + ".cmd")
+            if maybe_cmd.exists():
+                codex_exe = str(maybe_cmd)
     thread_id_file = pathlib.Path(args.thread_id_file).resolve()
     state_file = pathlib.Path(args.state_file).resolve()
     events_file = pathlib.Path(args.events_file).resolve()
@@ -3011,6 +3086,7 @@ def main() -> None:
     force_bootstrap_if_idle = bool(cfg.get("force_bootstrap_if_idle", False))
     bootstrap_command = str(cfg.get("bootstrap_command", "")).strip()
     bootstrap_label = str(cfg.get("bootstrap_label", "bootstrap")).strip() or "bootstrap"
+    run_shell_mode = resolve_run_shell_mode(str(cfg.get("run_shell", "auto")))
     mentor_enabled = bool(cfg.get("mentor_enabled", False))
     mentor_model = str(cfg.get("mentor_model", model)).strip() or model
     mentor_reasoning_effort = str(cfg.get("mentor_reasoning_effort", reasoning_effort)).strip() or reasoning_effort
@@ -3509,6 +3585,7 @@ def main() -> None:
                     workspace_root=workspace_root,
                     command=command,
                     run_label=run_label,
+                    run_shell_mode=run_shell_mode,
                     monitor_seconds=monitor_seconds,
                     cycle_poll_seconds=cycle_poll_seconds,
                     stop_flags=[stop_daemon_flag, stop_current_run_flag],
@@ -3559,6 +3636,7 @@ def main() -> None:
                         workspace_root=workspace_root,
                         command=retry_command,
                         run_label=retry_run_label,
+                        run_shell_mode=run_shell_mode,
                         monitor_seconds=monitor_seconds,
                         cycle_poll_seconds=cycle_poll_seconds,
                         stop_flags=[stop_daemon_flag, stop_current_run_flag],
