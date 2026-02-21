@@ -11,14 +11,411 @@ cd C:\Users\Max\code\llm_driven_cnns
 .\scripts\startup.ps1
 ```
 
+## Quick Start (Linux)
+```bash
+cd /path/to/llm_driven_cnns
+bash ./scripts/install_tools.sh
+bash ./scripts/login_loop_codex.sh
+bash ./scripts/startup.sh --config-path config/daemon_config.linux.json
+```
+
+## Script Reference
+This section is the single source of truth for `scripts/` usage.
+
+Conventions:
+- PowerShell examples assume Windows from repo root.
+- Bash examples assume Linux/macOS from repo root.
+- Defaults are shown exactly as implemented in the scripts.
+
+### `install_tools` (loop-control venv only)
+Purpose:
+- Creates/uses the loop venv.
+- Installs `requirements_wrapper.txt`.
+- Verifies `codex` CLI is available.
+
+PowerShell:
+```powershell
+.\scripts\install_tools.ps1 [-VenvPath <path>]
+```
+Options:
+- `-VenvPath` (default: `C:\Users\Max\code\llm_driven_cnns_venv`)
+
+Bash:
+```bash
+bash ./scripts/install_tools.sh [--venv-path <path>]
+```
+Options:
+- `--venv-path` (default: `<workspace_root>/llm_driven_cnns_venv`, where `<workspace_root>` is parent of repo)
+
+### `bootstrap_venvs` (loop + training venvs)
+Purpose:
+- Creates/uses both venvs:
+  - loop: `llm_driven_cnns_venv`
+  - training: `xray_fracture_benchmark_venv`
+- Installs loop requirements, training requirements, optional CUDA requirements, and optional auto-repair extras.
+
+PowerShell:
+```powershell
+.\scripts\bootstrap_venvs.ps1 `
+  [-WorkspaceRoot <path>] `
+  [-LoopRepoRoot <path>] `
+  [-TrainRepoRoot <path>] `
+  [-LoopVenvPath <path>] `
+  [-TrainVenvPath <path>] `
+  [-SkipCuda] `
+  [-SkipAutoRepairExtras]
+```
+Defaults:
+- `-WorkspaceRoot`: `C:\Users\Max\code`
+- `-LoopRepoRoot`: repo root (auto)
+- `-TrainRepoRoot`: `<WorkspaceRoot>\xray_fracture_benchmark`
+- `-LoopVenvPath`: `<WorkspaceRoot>\llm_driven_cnns_venv`
+- `-TrainVenvPath`: `<WorkspaceRoot>\xray_fracture_benchmark_venv`
+
+Bash:
+```bash
+bash ./scripts/bootstrap_venvs.sh \
+  [--workspace-root <path>] \
+  [--loop-repo-root <path>] \
+  [--train-repo-root <path>] \
+  [--loop-venv-path <path>] \
+  [--train-venv-path <path>] \
+  [--skip-cuda] \
+  [--skip-auto-repair-extras]
+```
+Defaults:
+- `--workspace-root`: parent of repo
+- `--loop-repo-root`: repo root
+- `--train-repo-root`: `<workspace_root>/xray_fracture_benchmark`
+- `--loop-venv-path`: `<workspace_root>/llm_driven_cnns_venv`
+- `--train-venv-path`: `<workspace_root>/xray_fracture_benchmark_venv`
+
+### `login_loop_codex` (isolated loop login)
+Purpose:
+- Performs Codex device auth with `CODEX_HOME` set to `.llm_loop/codex_home`.
+
+PowerShell:
+```powershell
+.\scripts\login_loop_codex.ps1 [-WorkspaceRoot <path>]
+```
+Options:
+- `-WorkspaceRoot` (default: `C:\Users\Max\code\llm_driven_cnns`)
+
+Bash:
+```bash
+bash ./scripts/login_loop_codex.sh [--workspace-root <path>]
+```
+Options:
+- `--workspace-root` (default: repo root)
+
+### `startup` (orchestrated start helper)
+Purpose:
+- Links data.
+- Optionally schedules finish-up window.
+- Starts daemon foreground or background/new window.
+
+PowerShell:
+```powershell
+.\scripts\startup.ps1 `
+  [-ConfigPath <path>] `
+  [-StartInNewWindow] `
+  [-RunHours <hours>] `
+  [-FinishupMinutes <int>] `
+  [-FinishupFinalTrainingRounds <int>] `
+  [-FinishupTopK <int>] `
+  [-FinishupNote <text>]
+```
+Defaults:
+- `-ConfigPath`: `config/daemon_config.json`
+- `-RunHours`: `0` (disabled)
+- `-FinishupMinutes`: `60`
+- `-FinishupFinalTrainingRounds`: `1`
+- `-FinishupTopK`: `10`
+- `-FinishupNote`: empty
+
+Bash:
+```bash
+bash ./scripts/startup.sh \
+  [--config-path <path>] \
+  [--start-in-new-window] \
+  [--run-hours <hours>] \
+  [--finishup-minutes <int>] \
+  [--finishup-final-training-rounds <int>] \
+  [--finishup-top-k <int>] \
+  [--finishup-note <text>]
+```
+Defaults:
+- `--config-path`: `config/daemon_config.linux.json` if present, else `config/daemon_config.json`
+- `--run-hours`: `0`
+- `--finishup-minutes`: `60`
+- `--finishup-final-training-rounds`: `1`
+- `--finishup-top-k`: `10`
+- `--finishup-note`: empty
+- `--start-in-new-window`: starts daemon with `nohup` in background
+
+### `start_llm_daemon` (main daemon loop launcher)
+Purpose:
+- Initializes loop directories/files.
+- Verifies loop login.
+- Repeatedly invokes `scripts/llm_cycle.py`.
+- Writes heartbeat and degraded/stopped status.
+
+PowerShell:
+```powershell
+.\scripts\start_llm_daemon.ps1 [-ConfigPath <path>]
+```
+Options:
+- `-ConfigPath` (default: `config/daemon_config.json`)
+
+Bash:
+```bash
+bash ./scripts/start_llm_daemon.sh [--config-path <path>]
+```
+Options:
+- `--config-path` (default: `config/daemon_config.linux.json` if present, else `config/daemon_config.json`)
+
+### `status` (one-shot health dump)
+Purpose:
+- Prints heartbeat, state, finish-up request, storyline tail, workpad tail, recent events.
+- Includes stale heartbeat warning logic.
+
+PowerShell:
+```powershell
+.\scripts\status.ps1 [-WorkspaceRoot <path>]
+```
+Options:
+- `-WorkspaceRoot` (default: `C:\Users\Max\code\llm_driven_cnns`)
+
+Bash:
+```bash
+bash ./scripts/status.sh [--workspace-root <path>]
+```
+Options:
+- `--workspace-root` (default: repo root)
+
+### `watch_status` (refreshing monitor)
+Purpose:
+- Clears screen and calls status repeatedly.
+
+PowerShell:
+```powershell
+.\scripts\watch_status.ps1 [-WorkspaceRoot <path>] [-IntervalSeconds <int>] [-Once]
+```
+Defaults:
+- `-WorkspaceRoot`: `C:\Users\Max\code\llm_driven_cnns`
+- `-IntervalSeconds`: `60` (minimum effective: `5`)
+
+Bash:
+```bash
+bash ./scripts/watch_status.sh [--workspace-root <path>] [--interval-seconds <int>] [--once]
+```
+Defaults:
+- `--workspace-root`: repo root
+- `--interval-seconds`: `60` (minimum effective: `5`)
+
+### `stop_llm_daemon` (graceful stop flags)
+Purpose:
+- Creates `.llm_loop/STOP_CURRENT_RUN` and `.llm_loop/STOP_DAEMON`.
+
+PowerShell:
+```powershell
+.\scripts\stop_llm_daemon.ps1 [-WorkspaceRoot <path>]
+```
+Options:
+- `-WorkspaceRoot` (default: `C:\Users\Max\code\llm_driven_cnns`)
+
+Bash:
+```bash
+bash ./scripts/stop_llm_daemon.sh [--workspace-root <path>]
+```
+Options:
+- `--workspace-root` (default: repo root)
+
+### `request_finishup` (finish-up control file manager)
+Purpose:
+- Creates, schedules, shows, or cancels `.llm_loop/FINISH_UP.json`.
+
+PowerShell:
+```powershell
+.\scripts\request_finishup.ps1 `
+  [-WorkspaceRoot <path>] `
+  [-MinutesLeft <int>] `
+  [-FinalTrainingRounds <int>] `
+  [-TopK <int>] `
+  [-Note <text>] `
+  [-ActivateInMinutes <int>] `
+  [-ActivateAtUtc <iso8601>] `
+  [-RunHours <float>] `
+  [-ForceReportNow] `
+  [-Cancel] `
+  [-Show]
+```
+Defaults and bounds:
+- `-WorkspaceRoot`: `C:\Users\Max\code\llm_driven_cnns`
+- `-MinutesLeft`: `60` (minimum effective: `5`)
+- `-FinalTrainingRounds`: `1` (minimum effective: `0`)
+- `-TopK`: `10` (clamped to `3..20`)
+- `-RunHours`: `0` (disabled)
+
+Bash:
+```bash
+bash ./scripts/request_finishup.sh \
+  [--workspace-root <path>] \
+  [--minutes-left <int>] \
+  [--final-training-rounds <int>] \
+  [--top-k <int>] \
+  [--note <text>] \
+  [--activate-in-minutes <int>] \
+  [--activate-at-utc <iso8601>] \
+  [--run-hours <float>] \
+  [--force-report-now] \
+  [--cancel] \
+  [--show]
+```
+Defaults and bounds:
+- `--workspace-root`: repo root
+- `--minutes-left`: `60` (minimum effective: `5`)
+- `--final-training-rounds`: `1` (minimum effective: `0`)
+- `--top-k`: `10` (clamped to `3..20`)
+- `--run-hours`: `0` (disabled)
+
+### `generate_finishup_report.py` (manual report generator)
+Purpose:
+- Builds condensed story, paper-style report, and leaderboard artifacts from run history.
+
+Usage:
+```bash
+python ./scripts/generate_finishup_report.py \
+  --workspace-root <path> \
+  [--repo-root <path>] \
+  [--top-k <int>] \
+  [--condensed-story-out <path>] \
+  [--paper-report-out <path>] \
+  [--leaderboard-json-out <path>] \
+  [--leaderboard-md-out <path>]
+```
+Defaults:
+- `--top-k`: `10`
+- Optional output paths default to standard `.llm_loop/artifacts/` locations when omitted.
+
+### `link_data` (repo `data` link helper)
+Purpose:
+- Ensures `./data` points to training data root.
+
+PowerShell:
+```powershell
+.\scripts\link_data.ps1 [-WorkspaceRoot <path>] [-DataSourceRoot <path>]
+```
+Defaults:
+- `-WorkspaceRoot`: `C:\Users\Max\code\llm_driven_cnns`
+- `-DataSourceRoot`: `C:\Users\Max\code\xray_fracture_benchmark\data`
+- Creates a Windows junction at `<WorkspaceRoot>\data`.
+
+Bash:
+```bash
+bash ./scripts/link_data.sh [--workspace-root <path>] [--data-source-root <path>]
+```
+Defaults:
+- `--workspace-root`: repo root
+- `--data-source-root`: `../xray_fracture_benchmark/data` (if present)
+- Creates a symlink at `<workspace_root>/data`.
+
+### `clean_fresh` (state reset between runs)
+Purpose:
+- Clears `.llm_loop` and `runs/`.
+- Optionally preserves loop login and/or data link.
+
+PowerShell:
+```powershell
+.\scripts\clean_fresh.ps1 [-WorkspaceRoot <path>] [-KeepDataLink] [-KeepCodexLogin]
+```
+Defaults:
+- `-WorkspaceRoot`: `C:\Users\Max\code\llm_driven_cnns`
+
+Bash:
+```bash
+bash ./scripts/clean_fresh.sh [--workspace-root <path>] [--keep-data-link] [--keep-codex-login]
+```
+Defaults:
+- `--workspace-root`: repo root
+
+### `llm_cycle.py` (internal cycle engine)
+Purpose:
+- Implements the decision/execution/evaluation cycle and event logging.
+
+Usage:
+- Not intended for direct manual invocation in normal operations.
+- Called by `start_llm_daemon.ps1`/`start_llm_daemon.sh` with required internal arguments.
+
+## Bootstrap Both Venvs
+Create and initialize:
+- loop/control venv (`llm_driven_cnns_venv`)
+- training/base venv (`xray_fracture_benchmark_venv`)
+
+```powershell
+cd C:\Users\Max\code\llm_driven_cnns
+.\scripts\bootstrap_venvs.ps1
+```
+
+What it installs:
+- loop venv: `requirements_wrapper.txt`
+- training venv: `xray_fracture_benchmark\requirements.txt`
+- training CUDA stack: `xray_fracture_benchmark\requirements-cu128.txt` (unless `-SkipCuda`)
+- training auto-repair extras from `config\daemon_config.json` (unless `-SkipAutoRepairExtras`)
+
+Useful flags:
+```powershell
+# CPU-only / no CUDA wheel install
+.\scripts\bootstrap_venvs.ps1 -SkipCuda
+
+# Keep base install small; skip proactive auto-repair extras
+.\scripts\bootstrap_venvs.ps1 -SkipAutoRepairExtras
+```
+
+Cluster note (Conda base + project venvs):
+```powershell
+# after activating your conda base env
+.\scripts\bootstrap_venvs.ps1 -WorkspaceRoot C:\path\to\workspace
+```
+
+Linux:
+```bash
+cd /path/to/llm_driven_cnns
+bash ./scripts/bootstrap_venvs.sh --workspace-root /path/to/workspace
+```
+
+## Rebuild Requirements
+Full training-stack rebuild file:
+```powershell
+cd C:\Users\Max\code\llm_driven_cnns
+python -m pip install -r .\requirements.txt
+```
+
+Notes:
+- `requirements.txt` includes sibling repo training deps (`..\xray_fracture_benchmark\requirements*.txt`).
+- `scripts\install_tools.ps1` installs only `requirements_wrapper.txt` to keep the loop-control venv lean.
+- `scripts/install_tools.sh` does the same on Linux.
+
+## Codex Exec Mode
+- No SDK mode switch is required for Linux migration; this project uses Codex CLI.
+- The loop uses JSON event output mode (`codex exec --json`) with `--output-schema` from `scripts/llm_cycle.py`.
+- Config template for Linux is provided at `config/daemon_config.linux.json`.
+- `run_shell` in daemon config controls command execution shell (`auto`, `bash`, `sh`, `pwsh`, `powershell`).
+
 ## Stop
 ```powershell
 .\scripts\stop_llm_daemon.ps1
+```
+```bash
+bash ./scripts/stop_llm_daemon.sh
 ```
 
 Wait until status shows stopped:
 ```powershell
 .\scripts\status.ps1
+```
+```bash
+bash ./scripts/status.sh
 ```
 
 ## Monitoring
@@ -26,10 +423,16 @@ One-shot status:
 ```powershell
 .\scripts\status.ps1
 ```
+```bash
+bash ./scripts/status.sh
+```
 
 Continuous watch with a fresh screen each refresh:
 ```powershell
 .\scripts\watch_status.ps1
+```
+```bash
+bash ./scripts/watch_status.sh --interval-seconds 30
 ```
 
 Examples:
